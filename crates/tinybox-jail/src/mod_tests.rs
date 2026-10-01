@@ -37,7 +37,7 @@ fn missing_root_errors() {
 #[test]
 fn default_backend_returns_something() {
     let b = default_backend();
-    assert!(!b.name().is_empty());
+    assert_ne!(b.name(), "");
 }
 
 #[test]

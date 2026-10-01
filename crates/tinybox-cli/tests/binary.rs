@@ -56,7 +56,7 @@ fn a_box_is_created_used_and_destroyed_through_the_binary() -> io::Result<()> {
 
     let removed = tinybox(state.path(), &["rm", "box-0"])?;
     assert!(removed.status.success());
-    assert!(stdout(&tinybox(state.path(), &["ls"])?).is_empty());
+    assert_eq!(stdout(&tinybox(state.path(), &["ls"])?), "");
     Ok(())
 }
 

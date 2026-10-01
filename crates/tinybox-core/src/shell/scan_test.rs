@@ -53,8 +53,8 @@ fn single_ampersand_stays_inside_its_segment() {
 
 #[test]
 fn empty_and_blank_segments_are_dropped() {
-    assert!(segs("").is_empty());
-    assert!(segs("  ;  ;\n").is_empty());
+    assert_eq!(segs("").len(), 0);
+    assert_eq!(segs("  ;  ;\n").len(), 0);
     assert_eq!(segs(";;a;;"), ["a"]);
 }
 

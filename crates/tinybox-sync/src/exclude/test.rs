@@ -42,7 +42,7 @@ fn a_workspace_with_no_ignore_files_excludes_nothing() -> Result<()> {
     let exclusions = Exclusions::read(dir.path())?;
 
     assert!(exclusions.is_empty());
-    assert!(exclusions.sources().is_empty());
+    assert_eq!(exclusions.sources().len(), 0);
     assert!(!excludes_file(&exclusions, "anything.txt"));
     Ok(())
 }
