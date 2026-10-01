@@ -94,7 +94,7 @@ fn it_declares_kernel_isolation_and_nothing_it_cannot_do() {
     assert!(!caps.supports(Capability::PauseResume));
     // Limits need a systemd user session, so they are not claimed by default.
     assert!(!caps.supports(Capability::ResourceLimits));
-    assert!(caps.declared().is_empty());
+    assert_eq!(caps.declared(), [] as [tinybox_core::Capability; 0]);
 }
 
 #[test]

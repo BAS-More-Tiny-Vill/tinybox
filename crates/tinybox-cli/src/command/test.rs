@@ -89,7 +89,7 @@ async fn a_box_can_be_created_used_and_removed() -> Result<()> {
     let removed = invoke(dir.path(), &["rm", "box-0"]).await;
     assert_eq!(removed.code, 0);
 
-    assert!(invoke(dir.path(), &["ls"]).await.out.is_empty());
+    assert_eq!(invoke(dir.path(), &["ls"]).await.out, "");
     Ok(())
 }
 
@@ -197,7 +197,7 @@ async fn run_creates_uses_and_destroys_a_box_in_one_step() -> Result<()> {
     assert_eq!(executed.code, 0);
     assert_eq!(executed.out.trim(), "once");
     // Nothing is left behind.
-    assert!(invoke(dir.path(), &["ls"]).await.out.is_empty());
+    assert_eq!(invoke(dir.path(), &["ls"]).await.out, "");
     Ok(())
 }
 
@@ -209,7 +209,7 @@ async fn run_leaves_nothing_behind_when_the_command_fails() -> Result<()> {
 
     assert_eq!(executed.code, 3);
     // A failing command must not leak a box; the cleanup is unconditional.
-    assert!(invoke(dir.path(), &["ls"]).await.out.is_empty());
+    assert_eq!(invoke(dir.path(), &["ls"]).await.out, "");
     Ok(())
 }
 
@@ -225,7 +225,7 @@ async fn run_reports_a_command_that_cannot_start_and_still_cleans_up() -> Result
 
     assert_eq!(executed.code, EXIT_TINYBOX_ERROR);
     assert!(executed.err.contains("error:"));
-    assert!(invoke(dir.path(), &["ls"]).await.out.is_empty());
+    assert_eq!(invoke(dir.path(), &["ls"]).await.out, "");
     Ok(())
 }
 
@@ -313,7 +313,7 @@ async fn a_usage_error_reports_clap_s_exit_code() -> Result<()> {
     let outcome = invoke(dir.path(), &["not-a-command"]).await;
 
     assert_eq!(outcome.code, 2);
-    assert!(!outcome.err.is_empty());
+    assert_ne!(outcome.err, "");
     Ok(())
 }
 
@@ -343,8 +343,8 @@ async fn requested_help_goes_to_stdout_and_usage_errors_to_stderr() -> Result<()
     // A mistake is a diagnostic, and stays on stderr.
     let misuse = invoke(dir.path(), &["not-a-command"]).await;
     assert_eq!(misuse.code, 2);
-    assert!(misuse.out.is_empty());
-    assert!(!misuse.err.is_empty());
+    assert_eq!(misuse.out, "");
+    assert_ne!(misuse.err, "");
     Ok(())
 }
 
@@ -848,11 +848,9 @@ async fn a_one_shot_docker_run_leaves_nothing_behind() -> Result<()> {
 
     assert_eq!(executed.code, 0);
     assert_eq!(executed.out.trim(), "once");
-    assert!(
-        invoke_scripted(dir.path(), host.clone(), &["ls"])
-            .await
-            .out
-            .is_empty()
+    assert_eq!(
+        invoke_scripted(dir.path(), host.clone(), &["ls"]).await.out,
+        ""
     );
     Ok(())
 }
@@ -932,7 +930,10 @@ async fn an_ssh_destination_that_would_be_read_as_an_option_is_refused() -> Resu
 
     assert_eq!(outcome.code, EXIT_TINYBOX_ERROR);
     assert!(outcome.err.contains("ssh destination"));
-    assert!(host.commands().is_empty());
+    assert_eq!(
+        host.commands(),
+        [] as [std::vec::Vec<std::string::String>; 0]
+    );
     Ok(())
 }
 
@@ -1151,7 +1152,7 @@ async fn templates_can_be_listed_and_forgotten() -> Result<()> {
     assert!(listed.out.contains("sha-9f2c0e1b7a4d"));
 
     assert_eq!(invoke(dir.path(), &["template", "rm", "ci"]).await.code, 0);
-    assert!(invoke(dir.path(), &["template", "ls"]).await.out.is_empty());
+    assert_eq!(invoke(dir.path(), &["template", "ls"]).await.out, "");
     Ok(())
 }
 

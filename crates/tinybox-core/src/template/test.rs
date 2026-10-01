@@ -102,7 +102,7 @@ fn a_template_name_follows_the_usual_identifier_rule() {
 
 #[test]
 fn an_empty_index_lists_nothing() -> Result<()> {
-    assert!(MemoryTemplates::default().list()?.is_empty());
+    assert_eq!(MemoryTemplates::default().list()?.len(), 0);
     Ok(())
 }
 

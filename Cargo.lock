@@ -281,6 +281,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "enumflags2"
+version = "0.7.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1027f7680c853e056ebcec683615fb6fbbc07dbaa13b4d5d9442b146ded4ecef"
+dependencies = [
+ "enumflags2_derive",
+]
+
+[[package]]
+name = "enumflags2_derive"
+version = "0.7.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "67c78a4d8fdf9953a5c9d458f9efe940fd97a0cab0941c075a813ac594733827"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -428,6 +448,17 @@ name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
+
+[[package]]
+name = "landlock"
+version = "0.4.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4cca98e95f35b29d469dade6724c6f96cec9236640f745a0e99b0334ec320ab1"
+dependencies = [
+ "enumflags2",
+ "libc",
+ "thiserror",
+]
 
 [[package]]
 name = "libc"
@@ -774,7 +805,7 @@ dependencies = [
 
 [[package]]
 name = "tinybox-cli"
-version = "0.1.8"
+version = "0.1.11"
 dependencies = [
  "async-trait",
  "clap",
@@ -794,7 +825,7 @@ dependencies = [
 
 [[package]]
 name = "tinybox-core"
-version = "0.1.8"
+version = "0.1.11"
 dependencies = [
  "async-trait",
  "serde",
@@ -804,7 +835,7 @@ dependencies = [
 
 [[package]]
 name = "tinybox-docker"
-version = "0.1.8"
+version = "0.1.11"
 dependencies = [
  "async-trait",
  "tempfile",
@@ -815,7 +846,7 @@ dependencies = [
 
 [[package]]
 name = "tinybox-host"
-version = "0.1.8"
+version = "0.1.11"
 dependencies = [
  "async-trait",
  "tempfile",
@@ -824,8 +855,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "tinybox-jail"
+version = "0.1.11"
+dependencies = [
+ "landlock",
+ "log",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tinybox-core",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "tinybox-linux"
-version = "0.1.8"
+version = "0.1.11"
 dependencies = [
  "async-trait",
  "tempfile",
@@ -836,7 +880,7 @@ dependencies = [
 
 [[package]]
 name = "tinybox-microvm"
-version = "0.1.8"
+version = "0.1.11"
 dependencies = [
  "async-trait",
  "serde",
@@ -849,7 +893,7 @@ dependencies = [
 
 [[package]]
 name = "tinybox-module"
-version = "0.1.8"
+version = "0.1.11"
 dependencies = [
  "serde_json",
  "tinybox-core",
@@ -863,7 +907,7 @@ dependencies = [
 
 [[package]]
 name = "tinybox-ssh"
-version = "0.1.8"
+version = "0.1.11"
 dependencies = [
  "async-trait",
  "tempfile",
@@ -876,7 +920,7 @@ dependencies = [
 
 [[package]]
 name = "tinybox-sync"
-version = "0.1.8"
+version = "0.1.11"
 dependencies = [
  "async-trait",
  "blake3",

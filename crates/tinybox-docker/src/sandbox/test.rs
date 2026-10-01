@@ -336,7 +336,7 @@ async fn a_docker_failure_carries_dockers_own_diagnostic() -> Result<()> {
         })
     );
     // A container that was never created must leave no record.
-    assert!(store.list()?.is_empty());
+    assert_eq!(store.list()?, Vec::<tinybox_core::BoxInfo>::new());
     Ok(())
 }
 
@@ -526,7 +526,7 @@ async fn destroying_a_box_removes_the_container_before_the_record() -> Result<()
     assert_eq!(argv[0..2], ["docker", "rm"]);
     assert!(argv.contains(&"--force".to_owned()));
     assert!(argv.contains(&"--volumes".to_owned()));
-    assert!(store.list()?.is_empty());
+    assert_eq!(store.list()?, Vec::<tinybox_core::BoxInfo>::new());
     Ok(())
 }
 
@@ -554,7 +554,7 @@ async fn an_unknown_box_is_reported_without_touching_docker() -> Result<()> {
     assert_eq!(sandbox.inspect(&missing).await.err(), expected);
     assert_eq!(sandbox.destroy(&missing).await.err(), expected);
     assert_eq!(sandbox.snapshot(&missing).await.err(), expected);
-    assert!(host.commands().is_empty());
+    assert_eq!(host.commands(), Vec::<Vec<String>>::new());
     Ok(())
 }
 
@@ -572,7 +572,7 @@ async fn an_invalid_spec_never_reaches_docker() -> Result<()> {
             limit: "memory_bytes"
         })
     );
-    assert!(host.commands().is_empty());
+    assert_eq!(host.commands(), Vec::<Vec<String>>::new());
     Ok(())
 }
 

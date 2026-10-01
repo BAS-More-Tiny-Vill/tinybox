@@ -93,5 +93,14 @@ pub fn script(
     parts.join(" ")
 }
 
+pub mod classify;
+pub mod env_guard;
+pub mod executor;
+pub mod scan;
+
+#[cfg(test)]
+mod classify_test;
+#[cfg(test)]
+mod scan_test;
 #[cfg(test)]
 mod test;

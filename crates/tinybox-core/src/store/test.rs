@@ -79,7 +79,7 @@ fn removing_a_box_forgets_it() -> Result<()> {
 
     store.remove(&recorded.id)?;
 
-    assert!(store.list()?.is_empty());
+    assert_eq!(store.list()?.len(), 0);
     assert!(store.get(&recorded.id).is_err());
     Ok(())
 }
@@ -140,7 +140,7 @@ fn allocation_steps_past_identifiers_that_are_not_generated_names() -> Result<()
 
 #[test]
 fn a_default_store_is_empty() -> Result<()> {
-    assert!(MemoryStore::default().list()?.is_empty());
+    assert_eq!(MemoryStore::default().list()?.len(), 0);
     Ok(())
 }
 
@@ -304,7 +304,7 @@ fn a_failure_that_is_not_a_collision_is_not_retried() -> Result<()> {
     // The rest of the stub behaves as the trait requires, so a future change
     // that starts calling it does not silently get nonsense.
     let id = BoxId::new("box-0")?;
-    assert!(ReadOnly.list()?.is_empty());
+    assert_eq!(ReadOnly.list()?.len(), 0);
     assert!(ReadOnly.get(&id).is_err());
     assert!(ReadOnly.set_state(&id, BoxState::Stopped).is_ok());
     assert!(ReadOnly.remove(&id).is_ok());

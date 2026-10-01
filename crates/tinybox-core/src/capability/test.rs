@@ -41,7 +41,7 @@ fn passthrough_admits_it_isolates_nothing() {
 fn each_builder_method_adds_exactly_one_capability() {
     let base = SandboxCapabilities::new(IsolationLevel::Kernel, SnapshotSupport::None);
 
-    assert!(base.declared().is_empty());
+    assert_eq!(base.declared().len(), 0);
     assert_eq!(base.with_fork().declared(), [Capability::Fork]);
     assert_eq!(
         base.with_pause_resume().declared(),
@@ -104,7 +104,7 @@ fn a_declared_set_lists_snapshot_and_feature_capabilities_together() {
         ]
     );
     assert_eq!(MICROVM.declared(), Capability::ALL);
-    assert!(SandboxCapabilities::PASSTHROUGH.declared().is_empty());
+    assert_eq!(SandboxCapabilities::PASSTHROUGH.declared().len(), 0);
 }
 
 #[test]

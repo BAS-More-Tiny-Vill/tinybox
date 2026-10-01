@@ -33,7 +33,14 @@
 //! # }
 //! ```
 
+mod oneshot;
 mod sandbox;
+
+pub use oneshot::{
+    DEFAULT_ONE_SHOT_CPUS, DEFAULT_ONE_SHOT_IMAGE, DEFAULT_ONE_SHOT_MEMORY_MB,
+    DEFAULT_ONE_SHOT_NETWORK, DockerCli, MAX_OUTPUT_BYTES, ONE_SHOT_WORKSPACE, OneShot,
+    OneShotOutcome,
+};
 
 pub use sandbox::{
     DEFAULT_BASE_IMAGE, DEFAULT_NAMESPACE, DockerSandbox, NAME, OWNER_LABEL, WORKSPACE_MOUNT,

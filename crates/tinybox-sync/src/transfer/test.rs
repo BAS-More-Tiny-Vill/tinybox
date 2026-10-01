@@ -364,7 +364,7 @@ fn packing_the_same_tree_twice_produces_identical_bytes() -> Result<()> {
     // Deterministic headers: no timestamps, no uid, no gid. Without this an
     // archive would differ on every run and be useless to cache or compare.
     assert_eq!(once, twice);
-    assert!(!once.is_empty());
+    assert_ne!(once.len(), 0);
     Ok(())
 }
 

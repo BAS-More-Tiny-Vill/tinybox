@@ -1,0 +1,47 @@
+[package]
+name = "tinybox-jail"
+description = "Per-process directory jail for spawned commands: Landlock, Seatbelt, and AppContainer."
+documentation = "https://docs.rs/tinybox-jail"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords.workspace = true
+categories.workspace = true
+publish = false
+
+[features]
+# Enables the Linux Landlock backend. Without it `LandlockBackend` reports
+# itself unavailable and default spawning returns an unsupported error.
+landlock = ["dep:landlock"]
+
+[dependencies]
+log = "0.4"
+# Reuse the workspace clock so registry timestamps can be controlled in tests.
+tinybox-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = { version = "0.4", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+# AppContainer profile APIs, ACL editing, STARTUPINFOEXW process spawn, and the
+# GENERIC_* file access masks used by `windows.rs`.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Isolation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

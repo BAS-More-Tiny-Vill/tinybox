@@ -15,6 +15,9 @@ publish = false
 [dependencies]
 tinybox-core.workspace = true
 async-trait.workspace = true
+# `DockerCli` runs the local `docker` client; one-shot runs need process spawning
+# and a deadline.
+tokio = { workspace = true, features = ["process"] }
 
 [dev-dependencies]
 tokio.workspace = true

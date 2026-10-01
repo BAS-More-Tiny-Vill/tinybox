@@ -93,7 +93,7 @@ fn a_command_crosses_as_one_base64_word() {
         .split_whitespace()
         .find_map(|part| part.strip_prefix("tinybox_cmd="))
         .unwrap_or_default();
-    assert!(!value.is_empty());
+    assert_ne!(value, "");
     assert!(
         value
             .chars()

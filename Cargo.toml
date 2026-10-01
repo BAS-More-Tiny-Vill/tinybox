@@ -9,6 +9,7 @@ members = [
     "crates/tinybox-core",
     "crates/tinybox-docker",
     "crates/tinybox-host",
+    "crates/tinybox-jail",
     "crates/tinybox-linux",
     "crates/tinybox-microvm",
     "crates/tinybox-module",
@@ -22,7 +23,7 @@ members = [
 exclude = ["vendor"]
 
 [workspace.package]
-version = "0.1.8"
+version = "0.1.11"
 edition = "2024"
 rust-version = "1.88"
 license = "GPL-3.0-only"
@@ -34,13 +35,14 @@ categories = ["development-tools", "virtualization"]
 [workspace.dependencies]
 # TinyBus defines the message types, interface macro, and frozen module ABI used
 # by the bus adapter. Socket and CLI features are unnecessary here.
-tinybus = { path = "vendor/tinybus/crates/tinybus", version = "0.1.0", default-features = false, features = [
+tinybus = { version = "=0.1.2", default-features = false, features = [
     "macros",
     "modules",
 ] }
 # The module-side SDK owns the isolated runtime and exports the ABI entrypoints
 # required by TinyBus's dynamic loader.
-tinybus-module = { path = "vendor/tinybus/crates/tinybus-module", version = "0.1.0" }
+tinybus-module = "=0.1.2"
+
 # Derive macros for the crate-wide error type in `tinybox-core`.
 thiserror = "2"
 # `Host` and `Sandbox` are object-safe async traits stored as trait objects in a
@@ -56,6 +58,7 @@ serde = { version = "1", features = ["derive"] }
 # Internal path dependencies between workspace members.
 tinybox-core = { path = "crates/tinybox-core", version = "0.1.5" }
 tinybox-host = { path = "crates/tinybox-host", version = "0.1.5" }
+tinybox-jail = { path = "crates/tinybox-jail", version = "0.1.5" }
 tinybox-linux = { path = "crates/tinybox-linux", version = "0.1.5" }
 tinybox-microvm = { path = "crates/tinybox-microvm", version = "0.1.5" }
 tinybox-docker = { path = "crates/tinybox-docker", version = "0.1.5" }
@@ -97,3 +100,7 @@ private_intra_doc_links = "warn"
 lto = "thin"
 codegen-units = 1
 strip = "debuginfo"
+
+[patch.crates-io]
+tinybus = { path = "vendor/tinybus/crates/tinybus" }
+tinybus-module = { path = "vendor/tinybus/crates/tinybus-module" }
