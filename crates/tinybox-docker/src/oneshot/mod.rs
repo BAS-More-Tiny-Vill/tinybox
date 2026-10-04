@@ -370,4 +370,5 @@ fn cap(text: &mut String, note: &str) {
 }
 
 #[cfg(all(test, unix))]
+#[path = "mod_tests.rs"]
 mod test;

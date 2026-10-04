@@ -225,4 +225,5 @@ impl Store for MemoryStore {
 }
 
 #[cfg(test)]
+#[path = "mod_tests.rs"]
 mod test;

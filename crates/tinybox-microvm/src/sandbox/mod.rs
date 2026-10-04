@@ -237,4 +237,5 @@ impl Sandbox for MicroVmSandbox {
 }
 
 #[cfg(test)]
+#[path = "mod_tests.rs"]
 mod test;

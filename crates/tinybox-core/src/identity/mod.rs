@@ -74,4 +74,5 @@ fn validate(kind: &'static str, value: &str) -> Result<()> {
 }
 
 #[cfg(test)]
+#[path = "mod_tests.rs"]
 mod test;

@@ -225,4 +225,5 @@ impl Sandbox for PassthroughSandbox {
 }
 
 #[cfg(test)]
+#[path = "mod_tests.rs"]
 mod test;

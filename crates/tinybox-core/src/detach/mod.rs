@@ -167,4 +167,5 @@ pub fn stop(process: &ProcessId, grace: std::time::Duration) -> ExecRequest {
 pub const DEFAULT_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[cfg(test)]
+#[path = "mod_tests.rs"]
 mod test;

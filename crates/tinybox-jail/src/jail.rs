@@ -10,8 +10,8 @@ use std::process::{Child, Command};
 
 /// Declarative description of a directory jail.
 ///
-/// One `root` (read/write), zero or more `read_only` paths, an optional
-/// allow-list of extra paths the child *may* read, and a network toggle.
+/// One `root` (read/write), zero or more extra `read_write` paths, zero or
+/// more `read_only` paths, and a network toggle.
 /// Backends translate this into Landlock rules, a Seatbelt profile, or an
 /// `AppContainer` ACL.
 #[derive(Debug, Clone)]
@@ -22,6 +22,11 @@ pub struct Jail {
     /// Extra paths the child may read (e.g. `/usr/lib`, the runtime-node
     /// install). Writes are still denied.
     pub read_only: Vec<PathBuf>,
+    /// Extra paths outside the root the child may read **and write**, with
+    /// the same access the root gets. Meant for host-owned scratch the child
+    /// must write to without it landing inside the root (e.g. a per-call
+    /// output-capture directory). Grant the narrowest directory that works.
+    pub read_write: Vec<PathBuf>,
     /// Allow outbound network. Most agent tools need this; some risky tools
     /// (untrusted code execution) should disable it.
     pub allow_net: bool,
@@ -40,6 +45,7 @@ impl Jail {
         Self {
             root: root.as_ref().to_path_buf(),
             read_only: Vec::new(),
+            read_write: Vec::new(),
             allow_net: true,
             allow_subprocess: true,
             label: label.into(),
@@ -50,6 +56,18 @@ impl Jail {
     #[must_use]
     pub fn add_read_only(mut self, path: impl AsRef<Path>) -> Self {
         self.read_only.push(path.as_ref().to_path_buf());
+        self
+    }
+
+    /// Grants read and write access to an extra path outside the root.
+    ///
+    /// Backends grant it exactly what they grant the root: a Landlock rule on
+    /// Linux, a `file-write*` subpath on macOS, an `AppContainer` ACL on
+    /// Windows. The path should exist before spawning; backends that need an
+    /// open handle (Landlock) fail the spawn when it does not.
+    #[must_use]
+    pub fn add_read_write(mut self, path: impl AsRef<Path>) -> Self {
+        self.read_write.push(path.as_ref().to_path_buf());
         self
     }
 
@@ -67,7 +85,7 @@ impl Jail {
         self
     }
 
-    /// Canonicalize `root` and `read_only` so backends never see `..` or
+    /// Canonicalize `root`, `read_only` and `read_write` so backends never see `..` or
     /// symlink trickery. Returns an error if `root` does not exist.
     ///
     /// # Errors
@@ -75,7 +93,7 @@ impl Jail {
     /// Returns the filesystem error encountered while canonicalizing `root`.
     pub fn canonicalize(&mut self) -> std::io::Result<()> {
         self.root = self.root.canonicalize()?;
-        for p in &mut self.read_only {
+        for p in self.read_only.iter_mut().chain(self.read_write.iter_mut()) {
             if let Ok(c) = p.canonicalize() {
                 *p = c;
             }

@@ -129,4 +129,5 @@ pub(crate) struct Entry {
 }
 
 #[cfg(test)]
+#[path = "mod_tests.rs"]
 mod test;

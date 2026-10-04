@@ -175,4 +175,5 @@ impl BoxSpec {
 }
 
 #[cfg(test)]
+#[path = "mod_tests.rs"]
 mod test;
