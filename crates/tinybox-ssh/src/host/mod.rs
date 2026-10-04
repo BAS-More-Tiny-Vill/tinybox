@@ -157,4 +157,5 @@ impl Host for SshHost {
 const LOCAL_HOST_NAME: &str = "local";
 
 #[cfg(test)]
+#[path = "mod_tests.rs"]
 mod test;

@@ -73,4 +73,5 @@ pub(crate) fn write<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 }
 
 #[cfg(test)]
+#[path = "mod_tests.rs"]
 mod test;

@@ -30,6 +30,7 @@ use crate::spec::BoxSpec;
 
 mod forward;
 #[cfg(test)]
+#[path = "forward_tests.rs"]
 mod forward_test;
 mod types;
 
@@ -223,4 +224,5 @@ pub trait Sandbox: std::fmt::Debug + Send + Sync + 'static {
 }
 
 #[cfg(test)]
+#[path = "mod_tests.rs"]
 mod test;

@@ -170,4 +170,5 @@ pub fn default_destination(name: &str) -> PathBuf {
 }
 
 #[cfg(test)]
+#[path = "mod_tests.rs"]
 mod test;

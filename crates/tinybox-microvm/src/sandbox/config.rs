@@ -234,4 +234,5 @@ async fn write(host: &dyn Host, path: &str, bytes: &[u8]) -> Result<()> {
 }
 
 #[cfg(test)]
+#[path = "config/config_tests.rs"]
 mod test;

@@ -99,8 +99,11 @@ pub mod executor;
 pub mod scan;
 
 #[cfg(test)]
+#[path = "classify_tests.rs"]
 mod classify_test;
 #[cfg(test)]
+#[path = "scan_tests.rs"]
 mod scan_test;
 #[cfg(test)]
+#[path = "mod_tests.rs"]
 mod test;

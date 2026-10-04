@@ -87,4 +87,5 @@ impl Templates for FileTemplates {
 }
 
 #[cfg(test)]
+#[path = "mod_tests.rs"]
 mod test;

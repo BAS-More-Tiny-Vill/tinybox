@@ -210,4 +210,5 @@ fn exit_diagnostic(tunnel: &mut SshTunnel) -> String {
 }
 
 #[cfg(test)]
+#[path = "forward/forward_tests.rs"]
 mod test;

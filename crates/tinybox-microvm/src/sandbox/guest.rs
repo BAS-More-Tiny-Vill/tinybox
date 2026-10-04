@@ -298,4 +298,5 @@ pub(super) fn parse_console(console: &str, sandbox: &str) -> Result<(String, i32
 }
 
 #[cfg(test)]
+#[path = "guest/guest_tests.rs"]
 mod test;

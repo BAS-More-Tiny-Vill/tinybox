@@ -120,4 +120,5 @@ impl Templates for MemoryTemplates {
 }
 
 #[cfg(test)]
+#[path = "mod_tests.rs"]
 mod test;

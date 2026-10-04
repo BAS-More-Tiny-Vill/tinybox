@@ -166,4 +166,5 @@ impl Sandbox for NamespaceSandbox {
 }
 
 #[cfg(test)]
+#[path = "mod_tests.rs"]
 mod test;

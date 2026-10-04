@@ -69,3 +69,38 @@ fn appcontainer_backend_reports_unavailable_until_child_bridge_lands() {
          PR #4723 for the orphan-spawn hazard"
     );
 }
+
+#[test]
+fn path_grants_give_read_write_paths_the_same_access_as_the_root() {
+    let jail = Jail::new(r"C:\work\root", "x")
+        .add_read_write(r"C:\state\capture\1")
+        .add_read_only(r"C:\tools");
+    let grants = path_grants(&jail);
+    let rw = GENERIC_READ | GENERIC_WRITE | DELETE;
+    assert_eq!(
+        grants,
+        vec![
+            (Path::new(r"C:\work\root"), rw),
+            (Path::new(r"C:\state\capture\1"), rw),
+            (Path::new(r"C:\tools"), GENERIC_READ),
+        ]
+    );
+}
+
+#[test]
+fn path_grants_keep_write_access_on_paths_also_listed_read_only() {
+    let jail = Jail::new(r"C:\work\root", "x")
+        .add_read_write(r"C:\state\capture")
+        .add_read_only(r"C:\work\root")
+        .add_read_only(r"C:\state\capture")
+        .add_read_only(r"C:\tools");
+    let rw = GENERIC_READ | GENERIC_WRITE | DELETE;
+    assert_eq!(
+        path_grants(&jail),
+        vec![
+            (Path::new(r"C:\work\root"), rw),
+            (Path::new(r"C:\state\capture"), rw),
+            (Path::new(r"C:\tools"), GENERIC_READ),
+        ]
+    );
+}

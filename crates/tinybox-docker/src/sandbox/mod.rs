@@ -281,4 +281,5 @@ impl Sandbox for DockerSandbox {
 }
 
 #[cfg(test)]
+#[path = "mod_tests.rs"]
 mod test;

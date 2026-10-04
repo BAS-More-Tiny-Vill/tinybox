@@ -118,4 +118,5 @@ tinybus_module::module_export_optional_static! {
 }
 
 #[cfg(test)]
+#[path = "mod_tests.rs"]
 mod test;

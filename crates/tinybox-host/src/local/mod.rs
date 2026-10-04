@@ -151,4 +151,5 @@ impl LocalHost {
 const EXIT_CODE_UNAVAILABLE: i32 = 128;
 
 #[cfg(test)]
+#[path = "mod_tests.rs"]
 mod test;
