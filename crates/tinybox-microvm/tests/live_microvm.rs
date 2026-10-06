@@ -119,7 +119,7 @@ async fn live_the_guest_has_its_own_kernel() -> Result<()> {
     // The whole point of this backend: not a namespace of the host kernel, a
     // different kernel entirely. A container cannot produce this result.
     assert_ne!(guest, host, "the guest is running the host's kernel");
-    assert_ne!(guest.len(), 0);
+    assert_ne!(guest, "");
     Ok(())
 }
 

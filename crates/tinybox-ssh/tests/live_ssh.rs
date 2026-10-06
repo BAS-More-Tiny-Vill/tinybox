@@ -286,7 +286,7 @@ async fn live_a_missing_working_directory_fails_rather_than_running_elsewhere() 
     // `cd ... &&` rather than `;`: running a build in the wrong directory would
     // be worse than failing.
     assert!(!output.succeeded());
-    assert_eq!(output.stdout_lossy().trim().len(), 0);
+    assert_eq!(output.stdout_lossy().trim(), "");
     Ok(())
 }
 
@@ -398,7 +398,7 @@ async fn live_an_unreachable_machine_fails_instead_of_hanging() -> Result<()> {
     let output = remote.run(&ExecRequest::new(["true"])).await?;
 
     assert!(!output.succeeded());
-    assert_ne!(output.stderr.len(), 0);
+    assert_ne!(output.stderr, Vec::<u8>::new());
     Ok(())
 }
 

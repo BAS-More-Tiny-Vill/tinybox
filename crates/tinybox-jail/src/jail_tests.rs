@@ -6,7 +6,7 @@ fn defaults_are_permissive() {
     assert!(j.allow_net);
     assert!(j.allow_subprocess);
     assert_eq!(j.label, "x");
-    assert_eq!(j.read_only.len(), 0);
+    assert_eq!(j.read_only, Vec::<PathBuf>::new());
 }
 
 #[test]

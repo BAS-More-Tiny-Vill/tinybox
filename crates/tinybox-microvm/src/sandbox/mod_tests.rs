@@ -305,7 +305,10 @@ async fn sources_it_cannot_build_a_guest_from_are_refused_at_creation() -> Resul
             })
         );
     }
-    assert_eq!(host.commands().len(), 0);
+    assert_eq!(
+        host.commands(),
+        [] as [std::vec::Vec<std::string::String>; 0]
+    );
     Ok(())
 }
 
@@ -384,7 +387,10 @@ async fn an_unknown_box_is_reported_without_booting_anything() -> Result<()> {
             .err(),
         expected
     );
-    assert_eq!(host.commands().len(), 0);
+    assert_eq!(
+        host.commands(),
+        [] as [std::vec::Vec<std::string::String>; 0]
+    );
     Ok(())
 }
 

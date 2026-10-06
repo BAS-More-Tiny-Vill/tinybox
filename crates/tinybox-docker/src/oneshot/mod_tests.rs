@@ -200,7 +200,7 @@ async fn run_times_out_with_the_pinned_message() {
         .unwrap();
     assert!(got.timed_out);
     assert_eq!(got.exit_code, -1);
-    assert_eq!(got.stdout.len(), 0);
+    assert_eq!(got.stdout, "");
     assert_eq!(got.stderr, "Command timed out after 0s and was killed");
 }
 

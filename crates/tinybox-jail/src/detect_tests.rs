@@ -16,7 +16,7 @@ fn unavailable_backend_rejects_spawning() {
 
 #[test]
 fn backend_detection_returns_a_backend() {
-    assert_ne!(pick_backend().name().len(), 0);
+    assert_ne!(pick_backend().name(), "");
 }
 
 #[test]

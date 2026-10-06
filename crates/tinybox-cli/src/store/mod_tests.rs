@@ -38,7 +38,7 @@ fn a_missing_file_reads_as_an_empty_store() -> Result<()> {
 
     // No initialization step: a fresh install must just work.
     assert!(!store.path().exists());
-    assert_eq!(store.list()?.len(), 0);
+    assert_eq!(store.list()?, [] as [tinybox_core::BoxInfo; 0]);
     assert_eq!(store.allocate_id()?.as_str(), "box-0");
     Ok(())
 }
@@ -117,7 +117,10 @@ fn state_changes_and_removals_persist() -> Result<()> {
     );
 
     store.remove(&recorded.id)?;
-    assert_eq!(FileStore::new(store.path()).list()?.len(), 0);
+    assert_eq!(
+        FileStore::new(store.path()).list()?,
+        [] as [tinybox_core::BoxInfo; 0]
+    );
     Ok(())
 }
 

@@ -25,7 +25,7 @@ async fn it_runs_a_command_and_captures_stdout() -> Result<()> {
     assert!(output.succeeded());
     assert_eq!(output.exit_code, 0);
     assert_eq!(output.stdout_lossy().trim(), "hello");
-    assert_eq!(output.stderr.len(), 0);
+    assert_eq!(output.stderr, [] as [u8; 0]);
     Ok(())
 }
 
@@ -137,7 +137,7 @@ async fn the_child_inherits_the_parent_environment() -> Result<()> {
         .run(&ExecRequest::new(["sh", "-c", "printf %s \"$PATH\""]))
         .await?;
 
-    assert_ne!(output.stdout.len(), 0);
+    assert_ne!(output.stdout, [] as [u8; 0]);
     Ok(())
 }
 
@@ -160,7 +160,7 @@ async fn a_child_reading_stdin_does_not_hang() -> Result<()> {
     let output = LocalHost::new().run(&ExecRequest::new(["cat"])).await?;
 
     assert!(output.succeeded());
-    assert_eq!(output.stdout.len(), 0);
+    assert_eq!(output.stdout, [] as [u8; 0]);
     Ok(())
 }
 

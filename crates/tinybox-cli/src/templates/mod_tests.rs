@@ -30,7 +30,10 @@ fn a_missing_file_reads_as_an_empty_index() -> Result<()> {
     let (templates, _dir) = templates()?;
 
     assert!(!templates.path().exists());
-    assert_eq!(templates.list()?.len(), 0);
+    assert_eq!(
+        templates.list()?,
+        [] as [(tinybox_core::TemplateName, tinybox_core::SnapshotId); 0]
+    );
     Ok(())
 }
 
@@ -73,7 +76,10 @@ fn removals_persist() -> Result<()> {
 
     templates.remove(&name("ci")?)?;
 
-    assert_eq!(FileTemplates::new(templates.path()).list()?.len(), 0);
+    assert_eq!(
+        FileTemplates::new(templates.path()).list()?,
+        [] as [(tinybox_core::TemplateName, tinybox_core::SnapshotId); 0]
+    );
     Ok(())
 }
 
