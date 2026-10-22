@@ -404,3 +404,11 @@ tinybox is sandbox-only. It enforces the confinement a caller asks for (filesyst
 network, processes, resources), reports observational events, and refuses what it
 cannot enforce. It owns no policy, approval, audit or command-classification logic;
 that is `tinysecurity`. See `docs/specs/contract-1-19.md`.
+
+## Docker one-shot lifecycle
+
+Contract 2.1 preserves the host's non-root workspace identity and process limit
+inside TinyBox. Timeout cleanup addresses only the invocation's unique container
+and reports whether stopping it succeeded; dropping the caller's wait does not
+abandon supervision. See [contract 2.1](docs/specs/contract-2-1.md) for cleanup,
+output bounds and the optional result evidence fields.

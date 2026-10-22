@@ -344,6 +344,8 @@ async fn run_docker_preserves_one_shot_settings_output_and_timeout()
     assert_eq!(output.stdout, "out");
     assert_eq!(output.stderr, "err");
     assert!(!output.timed_out);
+    assert_eq!(output.killed, None);
+    assert!(output.duration_ms.is_some());
 
     let argv: Vec<String> = std::fs::read(&argv_file)?
         .split(|byte| *byte == 0)
@@ -403,6 +405,8 @@ async fn run_without_workspace_preserves_docker_settings_without_host_mounts()
     assert_eq!(output.stdout, "out");
     assert_eq!(output.stderr, "err");
     assert!(!output.timed_out);
+    assert_eq!(output.killed, None);
+    assert!(output.duration_ms.is_some());
 
     let argv: Vec<String> = std::fs::read(&argv_file)?
         .split(|byte| *byte == 0)

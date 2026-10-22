@@ -47,7 +47,7 @@ fn fake(dir: &Path, body: &str) -> (DockerCli, PathBuf) {
 /// Another test thread may `fork` while our write handle is still open, and the
 /// child keeps that handle until it `exec`s; executing the script in that window
 /// fails with `ETXTBSY`. Probe (a no-op for the script) until the window closes.
-fn wait_until_executable(path: &Path) {
+pub(super) fn wait_until_executable(path: &Path) {
     for _ in 0..200 {
         match std::process::Command::new(path)
             .arg("--tinybox-probe")
@@ -105,6 +105,19 @@ fn defaults_produce_the_pinned_command_line() {
         "-c",
         "echo hi && ls",
     ]));
+    let index = expected
+        .iter()
+        .position(|argument| argument == "-m")
+        .unwrap();
+    expected.splice(
+        index..index,
+        [
+            "--user".to_owned(),
+            sandbox_user_for(Some(tmp.path())),
+            "--pids-limit".to_owned(),
+            "256".to_owned(),
+        ],
+    );
     assert_eq!(strings(&spec.argv()), expected);
 }
 
@@ -192,6 +205,19 @@ fn overrides_mounts_and_env_are_ordered() {
         "-c",
         "make test",
     ]));
+    let index = expected
+        .iter()
+        .position(|argument| argument == "-m")
+        .unwrap();
+    expected.splice(
+        index..index,
+        [
+            "--user".to_owned(),
+            sandbox_user_for(Some(tmp.path())),
+            "--pids-limit".to_owned(),
+            "256".to_owned(),
+        ],
+    );
     assert_eq!(strings(&spec.argv()), expected);
 }
 
@@ -217,16 +243,25 @@ async fn run_reports_exit_code_and_streams() {
             exit_code: 3,
             stdout: "out\n".into(),
             stderr: "err\n".into(),
-            timed_out: false
+            timed_out: false,
+            killed: None,
+            duration_ms: got.duration_ms,
         }
     );
-    assert_eq!(recorded(&out), strings(&spec.argv()));
+    let mut args = recorded(&out);
+    assert_eq!(args[2], "--name");
+    assert!(args[3].starts_with("tinybox-"));
+    args.drain(2..4);
+    assert_eq!(args, strings(&spec.argv()));
 }
 
 #[tokio::test]
 async fn run_times_out_with_the_pinned_message() {
     let tmp = tempfile::tempdir().unwrap();
-    let (cli, _) = fake(tmp.path(), "exec sleep 5");
+    let (cli, _) = fake(
+        tmp.path(),
+        "if [ \"$1\" = kill ]; then exit 0; fi; exec sleep 5",
+    );
     let got = cli
         .run_one_shot(&OneShot::new(tmp.path(), "x"), Duration::from_millis(300))
         .await
@@ -234,7 +269,10 @@ async fn run_times_out_with_the_pinned_message() {
     assert!(got.timed_out);
     assert_eq!(got.exit_code, -1);
     assert_eq!(got.stdout.len(), 0);
-    assert_eq!(got.stderr, "Command timed out after 0s and was killed");
+    assert_eq!(
+        got.stderr,
+        "Command timed out after 0s and the container was killed"
+    );
 }
 
 #[tokio::test]

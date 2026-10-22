@@ -55,7 +55,7 @@ The interface is `ai.tinyhumans.tinybox.Box` at
 | KillStdio | ProcessRef | () |
 | StdioStatus | ProcessRef | StdioStatus |
 
-Capabilities advertises contract version 2.0. Hosts require equal majors and a
+Capabilities advertises contract version 2.1. Hosts require equal majors and a
 module minor at least as new as their vocabulary, using
 `tinybox_bus::is_compatible`. Contract 1.0 was the original discovery-only
 surface; 1.1 added reserved resource/process ownership and terminal shutdown;
@@ -427,3 +427,9 @@ unsupported and refuse before starting the child. See
 Version 2.0 removes TinyBox command classification and execution-policy results
 after the contract 1.22 deprecation window. Hosts must reject modules from a
 different contract major. See `docs/specs/contract-2-0.md`.
+
+Contract 2.1 adds Docker timeout cleanup evidence (`killed`) and measured elapsed
+milliseconds (`duration_ms`). One-shot execution enforces a non-root identity and
+process cap, drains bounded output, and keeps supervising an abandoned caller
+until targeted deadline cleanup completes. Hosts must not infer a confirmed kill
+from `timed_out` alone; see `docs/specs/contract-2-1.md`.

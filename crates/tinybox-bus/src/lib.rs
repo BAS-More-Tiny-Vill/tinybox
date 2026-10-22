@@ -82,7 +82,7 @@ pub use files::{
 /// 2.0 removes TinyBox-owned command policy classification and the
 /// `AnalyzeShell.hidden_execution` policy signal. Generic shell structure facts
 /// and transport helpers remain.
-pub const CONTRACT_VERSION: (u32, u32) = (2, 0);
+pub const CONTRACT_VERSION: (u32, u32) = (2, 1);
 
 /// Whether this host vocabulary can bind to a module's advertised version.
 /// The major must match and the module's minor must include every host member.
@@ -520,8 +520,14 @@ pub struct DockerRunOutput {
     pub stdout: String,
     /// Bounded, lossily decoded stderr.
     pub stderr: String,
-    /// Whether the module stopped the command after its deadline.
+    /// Whether the command exceeded its deadline; this alone does not prove a stop.
     pub timed_out: bool,
+    /// Whether Docker confirmed targeted timeout cleanup. Older modules omit it.
+    #[serde(default)]
+    pub killed: Option<bool>,
+    /// Observed elapsed milliseconds, including bounded cleanup; never a requested limit.
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
 }
 
 /// Check whether the module's Docker daemon responds within a bounded interval.

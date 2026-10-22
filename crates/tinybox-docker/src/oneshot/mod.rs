@@ -4,13 +4,15 @@
 //! open and `docker exec`s into it. Some callers want the opposite contract:
 //! every command gets a **fresh** container, nothing persists between commands,
 //! and the container removes itself when the command exits. That is what this
-//! module provides, and it deliberately reproduces one exact command line — the
-//! flags below, in this order — because callers pin it.
+//! module provides. Its command line retains explicit resource and mount policy,
+//! with a mandatory non-root identity and process-count limit.
 //!
 //! The command line is built by [`OneShot::argv`], a pure function (apart from
 //! resolving symlinks in mount paths), so it can be tested without a daemon.
 //! [`DockerCli`] runs it, probes the daemon, and kills labelled stragglers; its
 //! program name is injectable so tests can substitute a fake binary.
+
+mod execution;
 
 use std::ffi::{OsStr, OsString};
 use std::io;
@@ -188,6 +190,12 @@ impl OneShot {
             push("--cap-drop");
             push(cap);
         }
+        push("--user");
+        push(&sandbox_user_for(
+            self.mount_workspace.then_some(self.workspace.as_path()),
+        ));
+        push("--pids-limit");
+        push("256");
         push("-m");
         push(&format!("{}m", self.memory_mb));
         push("--cpus");
@@ -234,6 +242,22 @@ impl OneShot {
     }
 }
 
+/// Use the non-root workspace owner; never inherit a root identity.
+fn sandbox_user_for(workspace: Option<&Path>) -> String {
+    #[cfg(unix)]
+    if let Some(workspace) = workspace {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(metadata) = workspace.metadata()
+            && metadata.uid() != 0
+        {
+            return format!("{}:{}", metadata.uid(), metadata.gid());
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = workspace;
+    "65534:65534".to_owned()
+}
+
 fn resolve(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
@@ -251,6 +275,11 @@ pub struct OneShotOutcome {
     pub stderr: String,
     /// Whether the run exceeded its deadline.
     pub timed_out: bool,
+    /// Whether targeted timeout cleanup confirmed the workload stopped.
+    /// `None` means no timeout occurred; `Some(false)` must never imply a kill.
+    pub killed: Option<bool>,
+    /// Observed elapsed time, including bounded timeout cleanup.
+    pub duration_ms: u64,
 }
 
 /// A handle on the local `docker` command-line client.
@@ -295,51 +324,24 @@ impl DockerCli {
         result.is_ok_and(|output| output.status.success())
     }
 
-    /// Run `spec` in a fresh container and wait for it, up to `timeout`.
+    /// Run a fresh, non-root container with a process cap and a unique name.
     ///
-    /// A command that exits non-zero is a success here, reported in
-    /// [`OneShotOutcome::exit_code`]. Hitting the deadline is also an outcome
-    /// ([`OneShotOutcome::timed_out`]): the wait is abandoned, which cancels the
-    /// local client; the container carries `--rm` and, when labelled, can be
-    /// reaped by [`DockerCli::kill_labelled`].
+    /// The run is supervised through its deadline even if the caller drops its
+    /// wait. Timeout cleanup kills only this container, retries with forced
+    /// removal, and reports whether Docker confirmed the stop. Output is drained
+    /// with bounded memory; cleanup commands have their own short deadlines.
     ///
     /// # Errors
     ///
-    /// Returns the I/O error when the `docker` client cannot be started.
+    /// Returns an I/O error when the client cannot start or output cannot be read.
     pub async fn run_one_shot(
         &self,
         spec: &OneShot,
         timeout: Duration,
     ) -> io::Result<OneShotOutcome> {
-        let mut cmd = Command::new(&self.program);
-        cmd.args(spec.argv());
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
-
-        match tokio::time::timeout(timeout, cmd.output()).await {
-            Ok(Ok(output)) => {
-                let mut stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                let mut stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                cap(&mut stdout, "\n... [output truncated at 1MB]");
-                cap(&mut stderr, "\n... [stderr truncated at 1MB]");
-                Ok(OneShotOutcome {
-                    exit_code: output.status.code().unwrap_or(-1),
-                    stdout,
-                    stderr,
-                    timed_out: false,
-                })
-            }
-            Ok(Err(e)) => Err(e),
-            Err(_) => Ok(OneShotOutcome {
-                exit_code: -1,
-                stdout: String::new(),
-                stderr: format!(
-                    "Command timed out after {}s and was killed",
-                    timeout.as_secs()
-                ),
-                timed_out: true,
-            }),
-        }
+        tokio::spawn(execution::run(self.clone(), spec.clone(), timeout))
+            .await
+            .map_err(io::Error::other)?
     }
 
     /// Kill every running container carrying `label` (`key=value`), returning

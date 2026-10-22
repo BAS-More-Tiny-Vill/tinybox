@@ -148,6 +148,8 @@ async fn run_with_cli(
         stdout: outcome.stdout,
         stderr: outcome.stderr,
         timed_out: outcome.timed_out,
+        killed: outcome.killed,
+        duration_ms: Some(outcome.duration_ms),
     })
 }
 
