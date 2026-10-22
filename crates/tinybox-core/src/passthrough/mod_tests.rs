@@ -411,3 +411,106 @@ async fn stopping_succeeds_even_though_nothing_was_really_started() -> Result<()
     assert!(ran.argv[2].contains("kill -TERM"), "{ran:?}");
     Ok(())
 }
+
+#[tokio::test]
+async fn command_standard_input_reaches_the_host() -> Result<()> {
+    let (sandbox, host) = sandbox();
+    let created = sandbox.create(&spec()?).await?;
+    sandbox
+        .exec(
+            &created.id,
+            &ExecRequest::new(["cat"]).with_stdin(b"input".to_vec()),
+        )
+        .await?;
+    let seen = host.last().ok_or(Error::EmptyCommand {
+        sandbox: NAME.to_owned(),
+    })?;
+    assert_eq!(seen.stdin, Some(b"input".to_vec()));
+    Ok(())
+}
+
+#[derive(Debug, Default)]
+struct ObservingHost(RecordingHost);
+#[async_trait]
+impl Host for ObservingHost {
+    fn name(&self) -> &'static str {
+        "observing"
+    }
+    async fn run(&self, _: &ExecRequest) -> Result<ExecOutput> {
+        Err(Error::UnsupportedStreaming {
+            provider: "collected fixture must not run".into(),
+        })
+    }
+    async fn run_observed(
+        &self,
+        request: &ExecRequest,
+        observer: Arc<dyn crate::ExecutionObserver>,
+    ) -> Result<ExecOutput> {
+        self.0.seen().push(request.clone());
+        observer.output(crate::OutputStream::Stdout, b"live")?;
+        Ok(ExecOutput::new(7, b"live".to_vec(), Vec::new()))
+    }
+}
+#[derive(Debug, Default)]
+struct RecordingObserver(Mutex<Vec<u8>>);
+#[async_trait]
+impl crate::ExecutionObserver for RecordingObserver {
+    fn output(&self, _: crate::OutputStream, bytes: &[u8]) -> Result<()> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend_from_slice(bytes);
+        Ok(())
+    }
+}
+#[tokio::test]
+async fn observed_execution_resolves_workspace_environment_and_stdin_before_dispatch() -> Result<()>
+{
+    let host = Arc::new(ObservingHost::default());
+    let sandbox = PassthroughSandbox::new(host.clone(), Arc::new(MemoryStore::new()));
+    let created = sandbox
+        .create(&spec()?.with_env("BASE", "box").with_env("SHARED", "box"))
+        .await?;
+    let observer = Arc::new(RecordingObserver::default());
+    let mut request = ExecRequest::new(["fixture"]).with_env("SHARED", "request");
+    request.stdin = Some(b"input".to_vec());
+    let output = sandbox
+        .exec_observed(&created.id, &request, observer.clone())
+        .await?;
+    assert_eq!(output.exit_code, 7);
+    assert_eq!(
+        *observer.0.lock().unwrap_or_else(PoisonError::into_inner),
+        b"live"
+    );
+    let seen = host.0.last().ok_or(Error::EmptyCommand {
+        sandbox: NAME.into(),
+    })?;
+    assert_eq!(seen.cwd.as_deref(), Some(std::path::Path::new("/srv/work")));
+    assert_eq!(seen.env.get("SHARED").map(String::as_str), Some("request"));
+    assert_eq!(seen.env.get("BASE").map(String::as_str), Some("box"));
+    assert_eq!(seen.stdin, Some(b"input".to_vec()));
+    sandbox.destroy(&created.id).await?;
+    assert!(matches!(
+        sandbox.exec_observed(&created.id, &request, observer).await,
+        Err(Error::UnknownBox { .. })
+    ));
+    assert_eq!(host.0.seen().len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_unenforceable_network_allowlist_is_refused_at_creation() -> Result<()> {
+    let (sandbox, _host) = sandbox();
+    let policy =
+        crate::NetworkPolicy::Allowlist(crate::EgressAllowlist::new(["example.com"], [443]));
+    let result = sandbox.create(&spec()?.with_network(policy)).await;
+    assert!(matches!(
+        result,
+        Err(Error::ConstraintNotEnforced {
+            constraint: crate::Constraint::Network,
+            enforcement: crate::Enforcement::Unsupported,
+            ..
+        })
+    ));
+    Ok(())
+}

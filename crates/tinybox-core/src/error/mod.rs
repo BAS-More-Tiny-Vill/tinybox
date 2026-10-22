@@ -15,6 +15,10 @@ use crate::capability::Capability;
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Error {
+    /// Local grant discovery cannot resolve a Git user-home or installation-prefix include.
+    #[error("unsupported git include pathname expansion")]
+    UnsupportedGitIncludePath,
+
     /// An identifier was empty, over-long, or contained characters outside the
     /// permitted `[A-Za-z0-9._-]` set.
     #[error("identifier {value:?} is not a valid {kind}")]
@@ -39,12 +43,53 @@ pub enum Error {
         capability: Capability,
     },
 
+    /// The provider cannot produce live bounded output observations.
+    #[error("provider {provider} does not support live output observation")]
+    UnsupportedStreaming {
+        /// Provider that explicitly refused the operation.
+        provider: String,
+    },
+
+    /// A provider could not confirm cleanup of an observed execution and
+    /// retains the cleanup handle for a later retry.
+    #[error("provider {provider} has observed execution cleanup pending")]
+    ObservedCleanupPending {
+        /// Provider retaining the cleanup handle.
+        provider: String,
+    },
+
+    /// A host cannot safely access files in the workspace mounted for a box.
+    #[error("host {host} does not support workspace file transfer")]
+    UnsupportedHostFileTransfer {
+        /// The host provider that refused the request.
+        host: String,
+    },
+
+    /// A hard constraint could not be fully enforced before execution.
+    #[error("sandbox {sandbox} cannot enforce {constraint}: {enforcement}")]
+    ConstraintNotEnforced {
+        /// Backend refusing the request.
+        sandbox: String,
+        /// Requested security boundary.
+        constraint: crate::Constraint,
+        /// Actual level of support.
+        enforcement: crate::Enforcement,
+    },
+
     /// A resource limit was zero, and every limit tinybox applies must be
     /// positive to be meaningful.
     #[error("resource limit {limit} must be greater than zero")]
     ZeroResourceLimit {
         /// Which limit was zero, such as `memory_bytes`.
         limit: &'static str,
+    },
+
+    /// A network policy was malformed, such as an empty allowlist or one that
+    /// names a cloud metadata endpoint.
+    #[error("invalid network policy: {reason}")]
+    InvalidNetworkPolicy {
+        /// Stable, non-sensitive reason for rejecting the policy.
+        reason: &'static str,
     },
 
     /// A box was referenced that the sandbox does not know about.
@@ -80,6 +125,17 @@ pub enum Error {
         expected: crate::runtime::BoxState,
     },
 
+    /// A workspace-relative file path was empty, absolute, or not normalized.
+    #[error("workspace file path is invalid")]
+    InvalidWorkspacePath,
+
+    /// A file-transfer operation used an invalid offset or handle state.
+    #[error("workspace file transfer is invalid: {reason}")]
+    InvalidFileTransfer {
+        /// Stable, non-sensitive reason for rejecting the operation.
+        reason: &'static str,
+    },
+
     /// A sandbox was handed a workspace source it cannot materialize.
     ///
     /// Distinct from [`Error::Unsupported`], which is about a capability the
@@ -107,6 +163,13 @@ pub enum Error {
     DuplicateBox {
         /// The identifier that was already taken.
         id: String,
+    },
+
+    /// Collected stdout and stderr exceeded an enforced memory budget.
+    #[error("command output exceeded {limit} bytes")]
+    OutputLimitExceeded {
+        /// Maximum combined output bytes.
+        limit: usize,
     },
 
     /// An operating-system call failed.

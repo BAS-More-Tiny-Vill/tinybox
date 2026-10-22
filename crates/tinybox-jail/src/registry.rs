@@ -28,7 +28,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -37,8 +37,16 @@ use std::time::UNIX_EPOCH;
 use serde::{Deserialize, Serialize};
 use tinybox_core::clock::{Clock, SystemClock};
 
+use super::default_backend;
 use super::jail::{Jail, JailBackend};
-use super::{default_backend, spawn_with};
+
+#[path = "registry_path.rs"]
+mod path;
+pub(crate) use path::canonicalize_missing;
+
+#[path = "registry_index_store.rs"]
+mod index_store;
+pub use index_store::{FileIndexStore, IndexStore};
 
 /// Metadata persisted for each jail.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,6 +85,7 @@ pub struct JailRegistry {
     base: PathBuf,
     index: Mutex<Index>,
     clock: Arc<dyn Clock>,
+    store: Arc<dyn IndexStore>,
 }
 
 impl JailRegistry {
@@ -99,15 +108,34 @@ impl JailRegistry {
     /// Returns an error if the registry directory cannot be created or its
     /// index cannot be read or decoded.
     pub fn open_with_clock(base: impl AsRef<Path>, clock: Arc<dyn Clock>) -> io::Result<Self> {
-        let base = base.as_ref().to_path_buf();
-        fs::create_dir_all(&base)?;
-        let idx_path = base.join(INDEX_FILENAME);
-        let index = if idx_path.exists() {
-            log::debug!(
-                "[cwd_jail] registry.open loading index {}",
-                idx_path.display()
-            );
-            let raw = fs::read(&idx_path)?;
+        let requested_base = base.as_ref().to_path_buf();
+        fs::create_dir_all(&requested_base)?;
+        let canonical = requested_base.canonicalize()?;
+        let store = Arc::new(FileIndexStore::new(canonical.join(INDEX_FILENAME)));
+        Self::open_with_store(requested_base, clock, store)
+    }
+
+    /// Open a registry whose index lives in `store` instead of
+    /// `<base>/index.json`.
+    ///
+    /// The jail directories stay under `base`; only the metadata moves. A host
+    /// passes a store on its `tinystoragedrivers` document port, so the index
+    /// follows the backend and scope it configured.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the base directory cannot be created or the index
+    /// cannot be read or decoded.
+    pub fn open_with_store(
+        base: impl AsRef<Path>,
+        clock: Arc<dyn Clock>,
+        store: Arc<dyn IndexStore>,
+    ) -> io::Result<Self> {
+        let requested_base = base.as_ref().to_path_buf();
+        fs::create_dir_all(&requested_base)?;
+        let base = requested_base.canonicalize()?;
+        let mut index = if let Some(raw) = store.load()? {
+            log::debug!("[cwd_jail] registry.open loaded index bytes={}", raw.len());
             serde_json::from_slice::<Index>(&raw)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
         } else {
@@ -117,6 +145,18 @@ impl JailRegistry {
                 schema_version: INDEX_SCHEMA_VERSION,
             }
         };
+        // Older records inherited the caller's lexical base (including trusted
+        // aliases or parent components). Normalize only that exact prefix;
+        // never normalize parent traversal introduced in a record's suffix.
+        for record in index.records.values_mut() {
+            if let Ok(suffix) = record.dir.strip_prefix(&requested_base)
+                && suffix
+                    .components()
+                    .all(|part| matches!(part, Component::Normal(_)))
+            {
+                record.dir = base.join(suffix);
+            }
+        }
         log::debug!(
             "[cwd_jail] registry.open base={} records={}",
             base.display(),
@@ -126,10 +166,11 @@ impl JailRegistry {
             base,
             index: Mutex::new(index),
             clock,
+            store,
         })
     }
 
-    /// Root directory of this registry.
+    /// Canonical root directory of this registry.
     pub fn base(&self) -> &Path {
         &self.base
     }
@@ -342,14 +383,8 @@ impl JailRegistry {
             record.dir.display()
         );
 
-        let resolved = record
-            .dir
-            .canonicalize()
-            .unwrap_or_else(|_| record.dir.clone());
-        let resolved_base = self
-            .base
-            .canonicalize()
-            .unwrap_or_else(|_| self.base.clone());
+        let resolved = path::canonicalize_missing(&record.dir)?;
+        let resolved_base = self.base.canonicalize()?;
         if !resolved.starts_with(&resolved_base) {
             // Index is suspicious — don't touch anything on disk and
             // leave the in-memory record alone too. The caller can
@@ -417,7 +452,7 @@ impl JailRegistry {
     pub fn spawn_in(&self, id: &str, cmd: Command) -> io::Result<Child> {
         let jail = self.jail_for(id)?;
         log::debug!("[cwd_jail] registry.spawn_in id={id}");
-        spawn_with(default_backend().as_ref(), &jail, cmd)
+        default_backend().spawn(&jail, cmd)
     }
 
     /// Same as [`Self::spawn_in`] but with a caller-supplied backend.
@@ -437,7 +472,7 @@ impl JailRegistry {
             "[cwd_jail] registry.spawn_in_with id={id} backend={}",
             backend.name()
         );
-        spawn_with(backend, &jail, cmd)
+        backend.spawn(&jail, cmd)
     }
 
     /// Build a canonicalized [`Jail`] for the given id, refusing if the
@@ -450,15 +485,38 @@ impl JailRegistry {
             .get(id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("no jail {id}")))?;
 
-        let resolved = record
+        if record
             .dir
-            .canonicalize()
-            .unwrap_or_else(|_| record.dir.clone());
-        let resolved_base = self
-            .base
-            .canonicalize()
-            .unwrap_or_else(|_| self.base.clone());
-        if !resolved.starts_with(&resolved_base) {
+            .components()
+            .any(|part| matches!(part, Component::ParentDir))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "registry paths must not contain parent traversal",
+            ));
+        }
+        // Spawning requires an existing root. Never make a synthetic missing
+        // path pass containment and then resolve it to a different target.
+        let resolved = match record.dir.canonicalize() {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                // Resolve missing ancestors for diagnostics only. Even if the
+                // path appears during this check, the original failed lookup
+                // is never upgraded to a successful spawn.
+                if error.kind() == io::ErrorKind::NotFound {
+                    let diagnostic = path::canonicalize_missing(&record.dir)?;
+                    if !diagnostic.starts_with(&self.base) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "jail directory is outside registry base",
+                        ));
+                    }
+                }
+                return Err(error);
+            }
+        };
+        let resolved_base = &self.base;
+        if !resolved.starts_with(resolved_base) {
             log::warn!(
                 "[cwd_jail] refusing spawn: jail {id} dir {} not under base {}",
                 resolved.display(),
@@ -474,38 +532,16 @@ impl JailRegistry {
             ));
         }
 
-        let mut jail = Jail::new(&record.dir, &record.label);
-        jail.canonicalize()?;
-        Ok(jail)
+        Ok(Jail::new(&resolved, &record.label))
     }
 
-    /// Atomic-rename write of the index. Falls back to direct write on
-    /// Windows if rename-over fails (Windows traditionally refused
-    /// rename-over-existing, though modern NTFS/Win10 supports it).
+    /// Write the index through the configured [`IndexStore`].
     fn persist(&self, idx: &Index) -> io::Result<()> {
-        let path = self.base.join(INDEX_FILENAME);
-        let tmp = self.base.join(format!("{INDEX_FILENAME}.tmp"));
         let bytes = serde_json::to_vec_pretty(idx)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        fs::write(&tmp, &bytes)?;
-        match fs::rename(&tmp, &path) {
-            Ok(()) => {
-                log::trace!(
-                    "[cwd_jail] registry.persist atomic-rename n={}",
-                    idx.records.len()
-                );
-                Ok(())
-            }
-            Err(e) => {
-                // Fallback: direct overwrite.
-                log::debug!(
-                    "[cwd_jail] registry.persist rename failed ({e}); falling back to overwrite"
-                );
-                fs::write(&path, &bytes)?;
-                let _ = fs::remove_file(&tmp);
-                Ok(())
-            }
-        }
+        self.store.save(&bytes)?;
+        log::trace!("[cwd_jail] registry.persist n={}", idx.records.len());
+        Ok(())
     }
 }
 

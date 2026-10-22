@@ -35,6 +35,13 @@
 //! the protocol — an embedded SSH client would face it too — and it is the one
 //! place in tinybox where the "no quoting, no injection" guarantee is
 //! re-established by hand rather than inherited.
+//!
+//! Live observed execution requires `setsid` on the remote machine. SSH
+//! command cancellation alone does not prove the remote process stopped, so
+//! this provider owns a remote process-group supervisor and waits for its
+//! cleanup acknowledgement. It refuses observed execution when that support
+//! is absent, and retains a retryable cleanup handle if the remote cannot
+//! confirm termination.
 
 mod host;
 

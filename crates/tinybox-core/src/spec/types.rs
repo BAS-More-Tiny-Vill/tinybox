@@ -219,7 +219,10 @@ impl PortMapping {
 /// The default is [`NetworkPolicy::Denied`] because the common case is running
 /// code that has no business making outbound connections, and an accidental
 /// default of "open" is the kind of mistake that is only noticed afterwards.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+///
+/// [`NetworkPolicy::Open`] shares the host's network view and is the
+/// highest-risk setting; see [`NetworkPolicy::is_highest_risk`].
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum NetworkPolicy {
     /// No network access at all.
@@ -227,14 +230,143 @@ pub enum NetworkPolicy {
     Denied,
     /// Outbound connections permitted; inbound not published.
     Egress,
+    /// Outbound connections permitted only to the named hosts and ports.
+    ///
+    /// A backend that cannot enforce the list refuses the box with
+    /// [`Error::ConstraintNotEnforced`]; it never widens the list to `Egress`.
+    Allowlist(EgressAllowlist),
     /// Unrestricted, sharing the host's network view.
     Open,
+}
+
+/// The hosts and ports an [`NetworkPolicy::Allowlist`] box may reach.
+///
+/// # DNS handling
+///
+/// Hostnames are resolved **outside** the box, once, when the enforcing
+/// backend builds its rules, and the resulting addresses are pinned: the box
+/// is given those addresses (or a proxy that connects only to them) and no
+/// resolver of its own. A name that later resolves elsewhere (a DNS rebinding
+/// attempt) therefore reaches nothing new. A backend that cannot pin
+/// resolution must report the network constraint `BestEffort` or
+/// `Unsupported`, never `Enforced`.
+///
+/// The cloud metadata endpoints in [`EgressAllowlist::is_metadata_host`] are
+/// refused at validation time and must also be blocked by the backend even
+/// when a hostname resolves to one of them.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct EgressAllowlist {
+    /// Host names or IP literals the box may connect to.
+    pub hosts: Vec<String>,
+    /// TCP ports the box may connect to on those hosts.
+    pub ports: Vec<u16>,
+}
+
+impl EgressAllowlist {
+    /// An allowlist of `hosts` on `ports`.
+    #[must_use]
+    pub fn new(
+        hosts: impl IntoIterator<Item = impl Into<String>>,
+        ports: impl IntoIterator<Item = u16>,
+    ) -> Self {
+        Self {
+            hosts: hosts.into_iter().map(Into::into).collect(),
+            ports: ports.into_iter().collect(),
+        }
+    }
+
+    /// Whether `host` names a cloud instance-metadata endpoint, which no
+    /// policy may ever allow.
+    #[must_use]
+    pub fn is_metadata_host(host: &str) -> bool {
+        let host = host.trim().trim_matches(['[', ']']).to_ascii_lowercase();
+        matches!(
+            host.as_str(),
+            "169.254.169.254"
+                | "169.254.170.2"
+                | "100.100.100.200"
+                | "fd00:ec2::254"
+                | "metadata.google.internal"
+                | "metadata"
+        ) || host.starts_with("::ffff:169.254.169.254")
+    }
+
+    /// Check the list is non-empty, well formed and names no metadata endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidNetworkPolicy`] naming the first problem.
+    pub fn validate(&self) -> Result<()> {
+        if self.hosts.is_empty() {
+            return Err(Error::InvalidNetworkPolicy {
+                reason: "allowlist has no hosts",
+            });
+        }
+        if self.ports.is_empty() || self.ports.contains(&0) {
+            return Err(Error::InvalidNetworkPolicy {
+                reason: "allowlist needs at least one non-zero port",
+            });
+        }
+        for host in &self.hosts {
+            let trimmed = host.trim();
+            if trimmed.is_empty()
+                || trimmed.contains(char::is_whitespace)
+                || trimmed.contains('/')
+                || trimmed.contains('*')
+            {
+                return Err(Error::InvalidNetworkPolicy {
+                    reason: "allowlist host is empty or not a plain host name",
+                });
+            }
+            if Self::is_metadata_host(trimmed) {
+                return Err(Error::InvalidNetworkPolicy {
+                    reason: "allowlist names a cloud metadata endpoint",
+                });
+            }
+        }
+        Ok(())
+    }
 }
 
 impl NetworkPolicy {
     /// Whether the workspace can open outbound connections.
     #[must_use]
-    pub const fn allows_egress(self) -> bool {
-        matches!(self, Self::Egress | Self::Open)
+    pub const fn allows_egress(&self) -> bool {
+        matches!(self, Self::Egress | Self::Allowlist(_) | Self::Open)
+    }
+
+    /// Whether this is the riskiest setting: the box shares the host's
+    /// network view with no filtering at all.
+    #[must_use]
+    pub const fn is_highest_risk(&self) -> bool {
+        matches!(self, Self::Open)
+    }
+
+    /// Check the policy is well formed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidNetworkPolicy`] for a malformed allowlist.
+    pub fn validate(&self) -> Result<()> {
+        match self {
+            Self::Allowlist(list) => list.validate(),
+            _ => Ok(()),
+        }
+    }
+
+    /// Refuse an allowlist on a backend that cannot enforce one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ConstraintNotEnforced`] for [`NetworkPolicy::Allowlist`].
+    pub fn refuse_allowlist(&self, sandbox: &str) -> Result<()> {
+        if matches!(self, Self::Allowlist(_)) {
+            return Err(Error::ConstraintNotEnforced {
+                sandbox: sandbox.to_owned(),
+                constraint: crate::Constraint::Network,
+                enforcement: crate::Enforcement::Unsupported,
+            });
+        }
+        Ok(())
     }
 }

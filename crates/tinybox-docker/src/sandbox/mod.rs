@@ -1,15 +1,23 @@
 //! A sandbox backed by Docker containers.
 
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc, Mutex, MutexGuard, PoisonError,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use tinybox_core::{
-    BoxId, BoxInfo, BoxSpec, BoxState, Capability, Clock, Error, ExecOutput, ExecRequest, Host,
-    IsolationLevel, ProcessId, Result, Sandbox, SandboxCapabilities, SnapshotId, SnapshotSupport,
-    Store, SystemClock, detach,
+    BoxId, BoxInfo, BoxSpec, BoxState, Capability, Clock, Error, ExecOutput, ExecRequest,
+    ExecutionObserver, Host, IsolationLevel, OutputStream, PortMapping, ProcessId, Result, Sandbox,
+    SandboxCapabilities, SnapshotId, SnapshotSupport, Store, SystemClock, detach,
 };
 
 mod args;
+mod observed;
 mod state;
 
 pub use args::container_name;
@@ -40,6 +48,94 @@ pub struct DockerSandbox {
     store: Arc<dyn Store>,
     clock: Arc<dyn Clock>,
     namespace: String,
+    failed_create_attempts: Arc<std::sync::Mutex<HashMap<BoxId, String>>>,
+    pending_observed_cleanup: Arc<Mutex<HashMap<String, CleanupHandle>>>,
+    observed_boxes: Arc<Mutex<HashMap<BoxId, ObservedBoxState>>>,
+}
+
+#[derive(Debug, Clone)]
+struct CleanupHandle {
+    id: BoxId,
+    token: String,
+    generation: u64,
+    launched: bool,
+    acknowledged: Arc<AtomicBool>,
+    unsupported: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Default)]
+struct ObservedBoxState {
+    generation: u64,
+    destroyed: bool,
+}
+
+#[derive(Debug, Default)]
+struct ObservedControl {
+    acknowledged: AtomicBool,
+    unsupported: AtomicBool,
+}
+
+#[derive(Debug)]
+struct RetainCleanupOnDrop {
+    observed_boxes: Arc<Mutex<HashMap<BoxId, ObservedBoxState>>>,
+    pending: Arc<Mutex<HashMap<String, CleanupHandle>>>,
+    handle: CleanupHandle,
+    armed: bool,
+}
+
+impl RetainCleanupOnDrop {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RetainCleanupOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            retain_observed_cleanup(&self.observed_boxes, &self.pending, self.handle.clone());
+        }
+    }
+}
+
+struct DockerExecutionObserver {
+    inner: Arc<dyn ExecutionObserver>,
+    host: Arc<dyn Host>,
+    namespace: String,
+    handle: CleanupHandle,
+    observed_boxes: Arc<Mutex<HashMap<BoxId, ObservedBoxState>>>,
+    pending: Arc<Mutex<HashMap<String, CleanupHandle>>>,
+    control: Arc<ObservedControl>,
+}
+
+impl std::fmt::Debug for DockerExecutionObserver {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DockerExecutionObserver")
+            .field("box_id", &self.handle.id)
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl ExecutionObserver for DockerExecutionObserver {
+    fn output(&self, stream: OutputStream, bytes: &[u8]) -> Result<()> {
+        self.inner.output(stream, bytes)
+    }
+
+    async fn cancelled(&self) {
+        self.inner.cancelled().await;
+        match cleanup_remote(self.host.clone(), &self.namespace, &self.handle).await {
+            Ok(unsupported) => {
+                self.control
+                    .unsupported
+                    .store(unsupported, Ordering::Release);
+                self.control.acknowledged.store(true, Ordering::Release);
+            }
+            Err(_) => {
+                retain_observed_cleanup(&self.observed_boxes, &self.pending, self.handle.clone());
+            }
+        }
+    }
 }
 
 /// The namespace used when a caller names none.
@@ -59,6 +155,9 @@ impl DockerSandbox {
             store,
             clock: Arc::new(SystemClock::new()),
             namespace: DEFAULT_NAMESPACE.to_owned(),
+            failed_create_attempts: Arc::default(),
+            pending_observed_cleanup: Arc::default(),
+            observed_boxes: Arc::default(),
         }
     }
 
@@ -98,7 +197,33 @@ impl DockerSandbox {
             store,
             clock: Arc::new(SystemClock::new()),
             namespace,
+            failed_create_attempts: Arc::default(),
+            pending_observed_cleanup: Arc::default(),
+            observed_boxes: Arc::default(),
         })
+    }
+
+    /// Route observed execution through a per-operation host while preserving
+    /// this sandbox's container identity and store.
+    ///
+    /// The returned view uses the same namespace, clock, box records, and
+    /// failed-create ownership as this sandbox, so an existing [`BoxId`] still
+    /// names the same container. Its observed-cleanup journal is private to the
+    /// view; cancelling one operation therefore cannot drain another view's
+    /// pending cleanup. This is intended for dispatching an existing observed
+    /// operation and must not be used to create or destroy a box through a
+    /// different host.
+    #[must_use]
+    pub fn for_observed_host(&self, host: Arc<dyn Host>) -> Self {
+        Self {
+            host,
+            store: self.store.clone(),
+            clock: self.clock.clone(),
+            namespace: self.namespace.clone(),
+            failed_create_attempts: self.failed_create_attempts.clone(),
+            pending_observed_cleanup: Arc::default(),
+            observed_boxes: self.observed_boxes.clone(),
+        }
     }
 
     /// The namespace this sandbox's containers are named under.
@@ -125,7 +250,6 @@ impl DockerSandbox {
     pub const fn declared_capabilities() -> SandboxCapabilities {
         SandboxCapabilities::new(IsolationLevel::Kernel, SnapshotSupport::Filesystem)
             .with_fork()
-            .with_resource_limits()
             .with_port_forward()
             .with_detach()
     }
@@ -133,9 +257,11 @@ impl DockerSandbox {
     /// Run a `docker` command, treating a non-zero exit as a failure.
     ///
     /// Unlike [`Host::run`], where a non-zero status is a result, a failing
-    /// `docker` invocation means the operation did not happen — so it becomes
-    /// an [`Error::Backend`] carrying Docker's own diagnostic, which is more
-    /// specific than anything reconstructed here.
+    /// `docker` invocation is an operation error — so it becomes an
+    /// [`Error::Backend`] carrying Docker's own diagnostic, which is more
+    /// specific than anything reconstructed here. A remote daemon may have
+    /// completed a create before its response was lost, so callers reconcile
+    /// that case by checking the created container's ownership label.
     async fn docker(&self, operation: &'static str, argv: Vec<String>) -> Result<String> {
         let output = self.host.run(&ExecRequest::new(argv)).await?;
         if !output.succeeded() {
@@ -146,6 +272,101 @@ impl DockerSandbox {
             });
         }
         Ok(output.stdout_lossy().trim().to_owned())
+    }
+
+    /// Remove a named container, treating Docker's explicit missing-container
+    /// response as an already-completed cleanup.
+    async fn remove_container(&self, argv: Vec<String>) -> Result<()> {
+        let output = self.host.run(&ExecRequest::new(argv)).await?;
+        if output.succeeded() || output.stderr_lossy().contains("No such container") {
+            return Ok(());
+        }
+        Err(Error::Backend {
+            sandbox: NAME.to_owned(),
+            operation: "remove the container",
+            message: output.stderr_lossy().trim().to_owned(),
+        })
+    }
+
+    fn discard_failed_create_record(&self, id: &BoxId, attempt: &str) {
+        if self.store.remove(id).is_err() {
+            self.failed_create_attempts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(id.clone(), attempt.to_owned());
+        }
+    }
+
+    fn remember_observed_cleanup(&self, handle: CleanupHandle) -> bool {
+        retain_observed_cleanup(&self.observed_boxes, &self.pending_observed_cleanup, handle)
+    }
+
+    fn observed_generation_for_exec(&self, id: &BoxId) -> Result<u64> {
+        let mut boxes = lock(&self.observed_boxes);
+        let state = boxes.entry(id.clone()).or_default();
+        if state.destroyed {
+            return Err(Error::InvalidState {
+                id: id.as_str().to_owned(),
+                actual: BoxState::Archived,
+                expected: BoxState::Ready,
+            });
+        }
+        Ok(state.generation)
+    }
+
+    fn mark_observed_box_created(&self, id: &BoxId) {
+        let mut boxes = lock(&self.observed_boxes);
+        let state = boxes.entry(id.clone()).or_default();
+        state.generation = state.generation.wrapping_add(1);
+        state.destroyed = false;
+    }
+
+    fn mark_observed_box_destroyed(&self, id: &BoxId) {
+        let mut boxes = lock(&self.observed_boxes);
+        let state = boxes.entry(id.clone()).or_default();
+        state.generation = state.generation.wrapping_add(1);
+        state.destroyed = true;
+        lock(&self.pending_observed_cleanup).retain(|_, handle| &handle.id != id);
+    }
+
+    fn observed_handle_is_current(&self, handle: &CleanupHandle) -> bool {
+        let boxes = lock(&self.observed_boxes);
+        boxes
+            .get(&handle.id)
+            .is_none_or(|state| !state.destroyed && state.generation == handle.generation)
+    }
+
+    fn clear_observed_cleanup(&self, token: &str) {
+        lock(&self.pending_observed_cleanup).remove(token);
+    }
+
+    fn pending_observed_handles(&self) -> Vec<CleanupHandle> {
+        lock(&self.pending_observed_cleanup)
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    async fn reserve_observed_execution(&self, handle: &CleanupHandle) -> Result<()> {
+        match reserve_remote(self.host.clone(), &self.namespace, handle).await {
+            Ok(()) => Ok(()),
+            Err(reserve_error) => {
+                self.cleanup_or_retain(handle.clone()).await?;
+                Err(reserve_error)
+            }
+        }
+    }
+
+    async fn cleanup_or_retain(&self, handle: CleanupHandle) -> Result<bool> {
+        if let Ok(unsupported) = cleanup_remote(self.host.clone(), &self.namespace, &handle).await {
+            Ok(unsupported)
+        } else if self.remember_observed_cleanup(handle) {
+            Err(Error::ObservedCleanupPending {
+                provider: NAME.to_owned(),
+            })
+        } else {
+            Ok(false)
+        }
     }
 }
 
@@ -159,8 +380,21 @@ impl Sandbox for DockerSandbox {
         Self::declared_capabilities()
     }
 
+    fn constraint_support(&self) -> tinybox_core::ConstraintSupport {
+        use tinybox_core::Constraint::{Cpu, Filesystem, Memory, Network, Pids};
+        use tinybox_core::Enforcement::Enforced;
+        tinybox_core::ConstraintSupport::NONE
+            .with(Filesystem, Enforced)
+            .with(Network, Enforced)
+            .with(Cpu, Enforced)
+            .with(Memory, Enforced)
+            .with(Pids, Enforced)
+    }
+
     async fn create(&self, spec: &BoxSpec) -> Result<BoxInfo> {
         spec.validate()?;
+        spec.network.refuse_allowlist(self.name())?;
+        let attempt = uuid::Uuid::new_v4().to_string();
         // Claim the record first. A container is expensive to create and has to
         // be torn down if the record cannot be written, so taking the cheap
         // resource first keeps the failure path short.
@@ -169,19 +403,67 @@ impl Sandbox for DockerSandbox {
 
         // Build the command before running anything, so a source this backend
         // cannot handle leaves no container behind.
-        let argv = match args::run(&self.namespace, &info.id, spec) {
+        let argv = match args::run(&self.namespace, &info.id, &attempt, spec) {
             Ok(argv) => argv,
             Err(error) => {
-                let _ = self.store.remove(&info.id);
+                self.discard_failed_create_record(&info.id, &attempt);
                 return Err(error);
             }
         };
 
         if let Err(error) = self.docker("create the container", argv).await {
-            // No container, so the record would point at nothing.
-            let _ = self.store.remove(&info.id);
+            // Docker reports a name collision before creating a container.
+            // Never remove that name: it belongs to the pre-existing owner.
+            if is_name_conflict(&error) {
+                self.discard_failed_create_record(&info.id, &attempt);
+                return Err(error);
+            }
+
+            // A lost response can hide a successful create. Reconcile only
+            // after the daemon confirms this exact attempt token; otherwise a
+            // deterministic name may refer to another store's container with
+            // the same box id.
+            match self
+                .docker(
+                    "inspect the failed create",
+                    args::inspect_attempt(&self.namespace, &info.id),
+                )
+                .await
+            {
+                Ok(owner) if owner == attempt => {
+                    if self
+                        .remove_container(args::remove(&self.namespace, &info.id))
+                        .await
+                        .is_ok()
+                    {
+                        self.discard_failed_create_record(&info.id, &attempt);
+                    } else {
+                        self.failed_create_attempts
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .insert(info.id.clone(), attempt);
+                    }
+                }
+                Ok(_) => {
+                    self.discard_failed_create_record(&info.id, &attempt);
+                }
+                Err(Error::Backend { message, .. }) if message.contains("No such container") => {
+                    self.discard_failed_create_record(&info.id, &attempt);
+                }
+                Err(_) => {
+                    self.failed_create_attempts
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(info.id.clone(), attempt);
+                }
+            }
             return Err(error);
         }
+        self.failed_create_attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&info.id);
+        self.mark_observed_box_created(&info.id);
         Ok(info)
     }
 
@@ -204,8 +486,16 @@ impl Sandbox for DockerSandbox {
     }
 
     async fn stop(&self, id: &BoxId, process: &ProcessId) -> Result<()> {
-        self.exec(id, &detach::stop(process, detach::DEFAULT_GRACE))
+        let output = self
+            .exec(id, &detach::stop(process, detach::DEFAULT_GRACE))
             .await?;
+        if !output.succeeded() {
+            return Err(Error::Backend {
+                sandbox: NAME.to_owned(),
+                operation: "stop a detached process",
+                message: output.stderr_lossy().trim().to_owned(),
+            });
+        }
         Ok(())
     }
 
@@ -224,6 +514,138 @@ impl Sandbox for DockerSandbox {
         self.host
             .run(&ExecRequest::new(args::exec(&self.namespace, id, request)?))
             .await
+    }
+
+    async fn exec_observed(
+        &self,
+        id: &BoxId,
+        request: &ExecRequest,
+        observer: Arc<dyn ExecutionObserver>,
+    ) -> Result<ExecOutput> {
+        let info = self.inspect(id).await?;
+        if !info.state.accepts_commands() {
+            return Err(Error::InvalidState {
+                id: id.as_str().to_owned(),
+                actual: info.state,
+                expected: BoxState::Ready,
+            });
+        }
+
+        let generation = self.observed_generation_for_exec(id)?;
+        let handle = CleanupHandle {
+            id: id.clone(),
+            token: uuid::Uuid::new_v4().simple().to_string(),
+            generation,
+            launched: false,
+            acknowledged: Arc::default(),
+            unsupported: Arc::default(),
+        };
+        let observed_request = observed::exec(&self.namespace, id, request, &handle.token)?;
+        let mut retain_on_drop = RetainCleanupOnDrop {
+            observed_boxes: self.observed_boxes.clone(),
+            pending: self.pending_observed_cleanup.clone(),
+            handle: handle.clone(),
+            armed: true,
+        };
+        if let Err(error) = self.reserve_observed_execution(&handle).await {
+            retain_on_drop.disarm();
+            return Err(error);
+        }
+        let handle = CleanupHandle {
+            launched: true,
+            ..handle
+        };
+        retain_on_drop.handle = handle.clone();
+        let control = Arc::new(ObservedControl::default());
+        let observer = Arc::new(DockerExecutionObserver {
+            inner: observer,
+            host: self.host.clone(),
+            namespace: self.namespace.clone(),
+            handle: handle.clone(),
+            observed_boxes: self.observed_boxes.clone(),
+            pending: self.pending_observed_cleanup.clone(),
+            control: control.clone(),
+        });
+
+        let result = self.host.run_observed(&observed_request, observer).await;
+
+        if matches!(&result, Err(Error::UnsupportedStreaming { .. })) {
+            let reservation = CleanupHandle {
+                launched: false,
+                ..handle.clone()
+            };
+            if self.cleanup_or_retain(reservation).await.is_err() {
+                retain_on_drop.disarm();
+                return Err(Error::ObservedCleanupPending {
+                    provider: NAME.to_owned(),
+                });
+            }
+            retain_on_drop.disarm();
+            return result;
+        }
+        if control.unsupported.load(Ordering::Acquire) {
+            retain_on_drop.disarm();
+            return Err(Error::UnsupportedStreaming {
+                provider: NAME.to_owned(),
+            });
+        }
+        if lock(&self.pending_observed_cleanup).contains_key(&handle.token) {
+            return Err(Error::ObservedCleanupPending {
+                provider: NAME.to_owned(),
+            });
+        }
+
+        if !control.acknowledged.load(Ordering::Acquire) {
+            if let Ok(unsupported) =
+                cleanup_remote(self.host.clone(), &self.namespace, &handle).await
+            {
+                control.unsupported.store(unsupported, Ordering::Release);
+                control.acknowledged.store(true, Ordering::Release);
+            } else if self.remember_observed_cleanup(handle) {
+                return Err(Error::ObservedCleanupPending {
+                    provider: NAME.to_owned(),
+                });
+            }
+        }
+
+        retain_on_drop.disarm();
+        if control.unsupported.load(Ordering::Acquire) {
+            return Err(Error::UnsupportedStreaming {
+                provider: NAME.to_owned(),
+            });
+        }
+        result
+    }
+
+    fn has_pending_observed_cleanup(&self) -> bool {
+        self.host.has_pending_observed_cleanup() || !lock(&self.pending_observed_cleanup).is_empty()
+    }
+
+    fn acknowledge_observed_cleanup_for_destroyed_box(&self, id: &BoxId) {
+        lock(&self.pending_observed_cleanup).retain(|_, handle| &handle.id != id);
+    }
+
+    async fn retry_observed_cleanup(&self) -> Result<()> {
+        let host_result = self.host.retry_observed_cleanup().await;
+        let handles = self.pending_observed_handles();
+        let mut failed = false;
+        for handle in handles {
+            if !self.observed_handle_is_current(&handle) {
+                self.clear_observed_cleanup(&handle.token);
+                continue;
+            }
+            match cleanup_remote(self.host.clone(), &self.namespace, &handle).await {
+                Err(_) if self.observed_handle_is_current(&handle) => failed = true,
+                _ => self.clear_observed_cleanup(&handle.token),
+            }
+        }
+        if failed {
+            Err(Error::ObservedCleanupPending {
+                provider: NAME.to_owned(),
+            })
+        } else {
+            host_result
+        }
     }
 
     async fn snapshot(&self, id: &BoxId) -> Result<SnapshotId> {
@@ -269,14 +691,179 @@ impl Sandbox for DockerSandbox {
         Ok(info)
     }
 
+    async fn published_ports(&self, id: &BoxId) -> Result<Vec<PortMapping>> {
+        let output = self
+            .docker(
+                "inspect published container ports",
+                args::published_ports(&self.namespace, id),
+            )
+            .await?;
+        args::parse_published_ports(&output)
+    }
+
     async fn destroy(&self, id: &BoxId) -> Result<()> {
         // Fail on an unknown box before touching Docker.
         self.store.get(id)?;
+        let attempt = self
+            .failed_create_attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(id)
+            .cloned();
+        if let Some(attempt) = attempt {
+            let owner = self
+                .docker(
+                    "inspect the failed create",
+                    args::inspect_attempt(&self.namespace, id),
+                )
+                .await;
+            match owner {
+                Ok(owner) if owner == attempt => {}
+                Err(Error::Backend { message, .. }) if message.contains("No such container") => {}
+                Ok(_) => {
+                    return Err(Error::Backend {
+                        sandbox: NAME.to_owned(),
+                        operation: "verify failed container ownership",
+                        message: "container belongs to another create attempt".to_owned(),
+                    });
+                }
+                Err(error) => return Err(error),
+            }
+        }
         // Remove the container first: a record without a container is
         // recoverable, a container without a record is a leak.
-        self.docker("remove the container", args::remove(&self.namespace, id))
+        self.remove_container(args::remove(&self.namespace, id))
             .await?;
-        self.store.remove(id)
+        self.mark_observed_box_destroyed(id);
+        self.acknowledge_observed_cleanup_for_destroyed_box(id);
+        self.store.remove(id)?;
+        self.failed_create_attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(id);
+        Ok(())
+    }
+}
+
+fn is_name_conflict(error: &Error) -> bool {
+    matches!(error, Error::Backend { message, .. }
+        if message.contains("container name") && message.contains("already in use"))
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn retain_observed_cleanup(
+    observed_boxes: &Mutex<HashMap<BoxId, ObservedBoxState>>,
+    pending: &Mutex<HashMap<String, CleanupHandle>>,
+    handle: CleanupHandle,
+) -> bool {
+    let boxes = lock(observed_boxes);
+    let is_current = boxes
+        .get(&handle.id)
+        .is_none_or(|state| !state.destroyed && state.generation == handle.generation);
+    if is_current {
+        lock(pending).insert(handle.token.clone(), handle);
+    }
+    is_current
+}
+
+async fn cleanup_remote(
+    host: Arc<dyn Host>,
+    namespace: &str,
+    handle: &CleanupHandle,
+) -> Result<bool> {
+    if !handle.launched {
+        reserve_remote(host.clone(), namespace, handle).await?;
+        let request = observed::abort_reservation(namespace, &handle.id, &handle.token);
+        let output = tokio::time::timeout(Duration::from_secs(8), host.run(&request))
+            .await
+            .map_err(|_| cleanup_timeout_error())??;
+        if !output.succeeded() {
+            return Err(Error::Backend {
+                sandbox: NAME.to_owned(),
+                operation: "release unstarted observed execution reservation",
+                message: output.stderr_lossy().trim().to_owned(),
+            });
+        }
+        return Ok(false);
+    }
+    if handle.acknowledged.load(Ordering::Acquire) {
+        release_receipt(host, namespace, handle).await?;
+        return Ok(handle.unsupported.load(Ordering::Acquire));
+    }
+    let request = observed::cancel_and_ack(namespace, &handle.id, &handle.token);
+    let output = tokio::time::timeout(Duration::from_secs(8), host.run(&request))
+        .await
+        .map_err(|_| cleanup_timeout_error())??;
+    if !output.succeeded() {
+        return Err(Error::Backend {
+            sandbox: NAME.to_owned(),
+            operation: "acknowledge observed execution cleanup",
+            message: output.stderr_lossy().trim().to_owned(),
+        });
+    }
+    let unsupported = output.stdout_lossy().trim() == "unsupported";
+    handle.unsupported.store(unsupported, Ordering::Release);
+    handle.acknowledged.store(true, Ordering::Release);
+    release_receipt(host, namespace, handle).await?;
+    Ok(unsupported)
+}
+
+async fn release_receipt(
+    host: Arc<dyn Host>,
+    namespace: &str,
+    handle: &CleanupHandle,
+) -> Result<()> {
+    let request = observed::release_receipt(namespace, &handle.id, &handle.token);
+    let output = tokio::time::timeout(Duration::from_secs(8), host.run(&request))
+        .await
+        .map_err(|_| Error::Backend {
+            sandbox: NAME.to_owned(),
+            operation: "release acknowledged observed execution receipt",
+            message: "container-side receipt release was not confirmed before the deadline"
+                .to_owned(),
+        })??;
+    if !output.succeeded() {
+        return Err(Error::Backend {
+            sandbox: NAME.to_owned(),
+            operation: "release acknowledged observed execution receipt",
+            message: output.stderr_lossy().trim().to_owned(),
+        });
+    }
+    Ok(())
+}
+
+async fn reserve_remote(
+    host: Arc<dyn Host>,
+    namespace: &str,
+    handle: &CleanupHandle,
+) -> Result<()> {
+    let request = observed::reserve(namespace, &handle.id, &handle.token);
+    let output = tokio::time::timeout(Duration::from_secs(8), host.run(&request))
+        .await
+        .map_err(|_| Error::Backend {
+            sandbox: NAME.to_owned(),
+            operation: "reserve observed execution control directory",
+            message: "container did not confirm its execution reservation before the deadline"
+                .to_owned(),
+        })??;
+    if !output.succeeded() || output.stdout_lossy().trim() != "ready" {
+        return Err(Error::Backend {
+            sandbox: NAME.to_owned(),
+            operation: "reserve observed execution control directory",
+            message: output.stderr_lossy().trim().to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn cleanup_timeout_error() -> Error {
+    Error::Backend {
+        sandbox: NAME.to_owned(),
+        operation: "acknowledge observed execution cleanup",
+        message: "container-side waiter did not acknowledge cleanup before the deadline".to_owned(),
     }
 }
 

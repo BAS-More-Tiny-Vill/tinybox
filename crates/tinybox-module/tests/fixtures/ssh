@@ -1,0 +1,6 @@
+#!/bin/sh
+# Local transport fixture: never connect to a network service.
+for argument do
+    remote_command=$argument
+done
+exec /bin/sh -c "$remote_command"

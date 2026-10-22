@@ -14,11 +14,25 @@ publish = false
 
 [dependencies]
 tinybox-core.workspace = true
+# Shell selection shares the module's serialized invocation vocabulary.
+tinybox-bus.workspace = true
+tinybox-jail.workspace = true
 async-trait.workspace = true
+# `Dir` keeps workspace file handles beneath the approved root without
+# resolving untrusted paths through ambient filesystem APIs.
+cap-std = "4"
 # `LocalHost` spawns a child and reads both its output streams concurrently,
 # which is what `tokio::process` is for; doing it by hand risks deadlocking on a
 # full pipe buffer.
-tokio = { workspace = true, features = ["process", "io-util"] }
+tokio = { workspace = true, features = ["process", "io-util", "sync"] }
+
+[target.'cfg(unix)'.dependencies]
+# Safe process-group signalling supervises descendants; access checks select executable shells.
+nix = { version = "0.31", default-features = false, features = ["signal", "process", "fs"] }
+
+[target.'cfg(windows)'.dependencies]
+# Job Objects keep supervised Windows descendants inside one killable process tree.
+command-group = { version = "5", features = ["with-tokio"] }
 
 [dev-dependencies]
 # Command tests run against real temporary directories rather than the CWD.

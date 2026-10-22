@@ -34,6 +34,7 @@
 //! ```
 
 mod oneshot;
+mod policy;
 mod sandbox;
 
 pub use oneshot::{
@@ -41,6 +42,8 @@ pub use oneshot::{
     DEFAULT_ONE_SHOT_NETWORK, DockerCli, MAX_OUTPUT_BYTES, ONE_SHOT_WORKSPACE, OneShot,
     OneShotOutcome,
 };
+
+pub use policy::{DANGEROUS_MOUNTS, HOST_NETWORK, run_policy_issues};
 
 pub use sandbox::{
     DEFAULT_BASE_IMAGE, DEFAULT_NAMESPACE, DockerSandbox, NAME, OWNER_LABEL, WORKSPACE_MOUNT,

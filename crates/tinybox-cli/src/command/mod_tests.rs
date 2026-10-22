@@ -89,7 +89,7 @@ async fn a_box_can_be_created_used_and_removed() -> Result<()> {
     let removed = invoke(dir.path(), &["rm", "box-0"]).await;
     assert_eq!(removed.code, 0);
 
-    assert_eq!(invoke(dir.path(), &["ls"]).await.out, "");
+    assert_eq!(invoke(dir.path(), &["ls"]).await.out.len(), 0);
     Ok(())
 }
 
@@ -109,7 +109,11 @@ async fn creating_a_box_warns_that_it_is_not_isolated() -> Result<()> {
 #[tokio::test]
 async fn a_box_persists_between_invocations() -> Result<()> {
     let dir = temp_dir()?;
-    invoke(dir.path(), &["create", "--dir", "/tmp"]).await;
+    invoke(
+        dir.path(),
+        &["create", "--dir", &dir.path().display().to_string()],
+    )
+    .await;
 
     // This is the whole reason the store is a file: a separate `run` call is
     // standing in for a separate process.
@@ -130,7 +134,12 @@ async fn a_command_runs_in_the_box_workspace() -> Result<()> {
     )
     .await;
 
-    let executed = invoke(dir.path(), &["exec", "box-0", "pwd"]).await;
+    #[cfg(windows)]
+    let cwd_command = ["exec", "box-0", "cmd.exe", "/D", "/C", "cd"].as_slice();
+    #[cfg(not(windows))]
+    let cwd_command = ["exec", "box-0", "pwd"].as_slice();
+    let executed = invoke(dir.path(), cwd_command).await;
+    assert_eq!(executed.code, 0, "{}", executed.err);
 
     assert_eq!(
         Path::new(executed.out.trim()).canonicalize().ok(),
@@ -144,7 +153,13 @@ async fn box_environment_reaches_the_command() -> Result<()> {
     let dir = temp_dir()?;
     invoke(
         dir.path(),
-        &["create", "--dir", "/tmp", "--env", "GREETING=hi"],
+        &[
+            "create",
+            "--dir",
+            &dir.path().display().to_string(),
+            "--env",
+            "GREETING=hi",
+        ],
     )
     .await;
 
@@ -161,7 +176,11 @@ async fn box_environment_reaches_the_command() -> Result<()> {
 #[tokio::test]
 async fn a_failing_command_sets_the_exit_code_without_being_an_error() -> Result<()> {
     let dir = temp_dir()?;
-    invoke(dir.path(), &["create", "--dir", "/tmp"]).await;
+    invoke(
+        dir.path(),
+        &["create", "--dir", &dir.path().display().to_string()],
+    )
+    .await;
 
     let executed = invoke(dir.path(), &["exec", "box-0", "sh", "-c", "exit 7"]).await;
 
@@ -175,7 +194,11 @@ async fn a_failing_command_sets_the_exit_code_without_being_an_error() -> Result
 #[tokio::test]
 async fn stderr_from_the_command_is_kept_separate() -> Result<()> {
     let dir = temp_dir()?;
-    invoke(dir.path(), &["create", "--dir", "/tmp"]).await;
+    invoke(
+        dir.path(),
+        &["create", "--dir", &dir.path().display().to_string()],
+    )
+    .await;
 
     let executed = invoke(
         dir.path(),
@@ -192,12 +215,22 @@ async fn stderr_from_the_command_is_kept_separate() -> Result<()> {
 async fn run_creates_uses_and_destroys_a_box_in_one_step() -> Result<()> {
     let dir = temp_dir()?;
 
-    let executed = invoke(dir.path(), &["run", "--dir", "/tmp", "echo", "once"]).await;
+    let executed = invoke(
+        dir.path(),
+        &[
+            "run",
+            "--dir",
+            &dir.path().display().to_string(),
+            "echo",
+            "once",
+        ],
+    )
+    .await;
 
     assert_eq!(executed.code, 0);
     assert_eq!(executed.out.trim(), "once");
     // Nothing is left behind.
-    assert_eq!(invoke(dir.path(), &["ls"]).await.out, "");
+    assert_eq!(invoke(dir.path(), &["ls"]).await.out.len(), 0);
     Ok(())
 }
 
@@ -205,11 +238,22 @@ async fn run_creates_uses_and_destroys_a_box_in_one_step() -> Result<()> {
 async fn run_leaves_nothing_behind_when_the_command_fails() -> Result<()> {
     let dir = temp_dir()?;
 
-    let executed = invoke(dir.path(), &["run", "--dir", "/tmp", "sh", "-c", "exit 3"]).await;
+    let executed = invoke(
+        dir.path(),
+        &[
+            "run",
+            "--dir",
+            &dir.path().display().to_string(),
+            "sh",
+            "-c",
+            "exit 3",
+        ],
+    )
+    .await;
 
     assert_eq!(executed.code, 3);
     // A failing command must not leak a box; the cleanup is unconditional.
-    assert_eq!(invoke(dir.path(), &["ls"]).await.out, "");
+    assert_eq!(invoke(dir.path(), &["ls"]).await.out.len(), 0);
     Ok(())
 }
 
@@ -225,7 +269,7 @@ async fn run_reports_a_command_that_cannot_start_and_still_cleans_up() -> Result
 
     assert_eq!(executed.code, EXIT_TINYBOX_ERROR);
     assert!(executed.err.contains("error:"));
-    assert_eq!(invoke(dir.path(), &["ls"]).await.out, "");
+    assert_eq!(invoke(dir.path(), &["ls"]).await.out.len(), 0);
     Ok(())
 }
 
@@ -313,7 +357,7 @@ async fn a_usage_error_reports_clap_s_exit_code() -> Result<()> {
     let outcome = invoke(dir.path(), &["not-a-command"]).await;
 
     assert_eq!(outcome.code, 2);
-    assert_ne!(outcome.err, "");
+    assert_ne!(outcome.err.len(), 0);
     Ok(())
 }
 
@@ -343,8 +387,8 @@ async fn requested_help_goes_to_stdout_and_usage_errors_to_stderr() -> Result<()
     // A mistake is a diagnostic, and stays on stderr.
     let misuse = invoke(dir.path(), &["not-a-command"]).await;
     assert_eq!(misuse.code, 2);
-    assert_eq!(misuse.out, "");
-    assert_ne!(misuse.err, "");
+    assert_eq!(misuse.out.len(), 0);
+    assert_ne!(misuse.err.len(), 0);
     Ok(())
 }
 
@@ -787,7 +831,7 @@ async fn inspecting_a_docker_box_reports_kernel_isolation() -> Result<()> {
     assert!(
         inspected
             .out
-            .contains("filesystem snapshots, forking, port forwarding, resource limits")
+            .contains("filesystem snapshots, forking, port forwarding")
     );
     // The workspace column shows the image, not a Debug dump.
     assert!(inspected.out.contains("workspace:  alpine:3"));
@@ -849,8 +893,11 @@ async fn a_one_shot_docker_run_leaves_nothing_behind() -> Result<()> {
     assert_eq!(executed.code, 0);
     assert_eq!(executed.out.trim(), "once");
     assert_eq!(
-        invoke_scripted(dir.path(), host.clone(), &["ls"]).await.out,
-        ""
+        invoke_scripted(dir.path(), host.clone(), &["ls"])
+            .await
+            .out
+            .len(),
+        0
     );
     Ok(())
 }
@@ -930,10 +977,7 @@ async fn an_ssh_destination_that_would_be_read_as_an_option_is_refused() -> Resu
 
     assert_eq!(outcome.code, EXIT_TINYBOX_ERROR);
     assert!(outcome.err.contains("ssh destination"));
-    assert_eq!(
-        host.commands(),
-        [] as [std::vec::Vec<std::string::String>; 0]
-    );
+    assert_eq!(host.commands().len(), 0);
     Ok(())
 }
 
@@ -1152,7 +1196,7 @@ async fn templates_can_be_listed_and_forgotten() -> Result<()> {
     assert!(listed.out.contains("sha-9f2c0e1b7a4d"));
 
     assert_eq!(invoke(dir.path(), &["template", "rm", "ci"]).await.code, 0);
-    assert_eq!(invoke(dir.path(), &["template", "ls"]).await.out, "");
+    assert_eq!(invoke(dir.path(), &["template", "ls"]).await.out.len(), 0);
     Ok(())
 }
 
@@ -1309,7 +1353,11 @@ async fn a_spawned_process_outlives_the_command_that_started_it() -> Result<()> 
     // in for a separate process, and the thing started by the first one is
     // still there for the second to ask about.
     let dir = temp_dir()?;
-    invoke(dir.path(), &["create", "--dir", "/tmp"]).await;
+    invoke(
+        dir.path(),
+        &["create", "--dir", &dir.path().display().to_string()],
+    )
+    .await;
 
     let spawned = invoke(dir.path(), &["spawn", "box-0", "sleep", "30"]).await;
     assert_eq!(spawned.code, 0);
@@ -1334,7 +1382,11 @@ async fn a_spawned_process_outlives_the_command_that_started_it() -> Result<()> 
 #[tokio::test]
 async fn asking_about_a_process_that_was_never_started_answers_gone() -> Result<()> {
     let dir = temp_dir()?;
-    invoke(dir.path(), &["create", "--dir", "/tmp"]).await;
+    invoke(
+        dir.path(),
+        &["create", "--dir", &dir.path().display().to_string()],
+    )
+    .await;
 
     let answer = invoke(dir.path(), &["ps", "box-0", "p1-0"]).await;
 
@@ -1347,7 +1399,11 @@ async fn asking_about_a_process_that_was_never_started_answers_gone() -> Result<
 async fn killing_a_process_that_has_already_exited_is_not_an_error() -> Result<()> {
     // Stopping something already stopped is the outcome the caller wanted.
     let dir = temp_dir()?;
-    invoke(dir.path(), &["create", "--dir", "/tmp"]).await;
+    invoke(
+        dir.path(),
+        &["create", "--dir", &dir.path().display().to_string()],
+    )
+    .await;
 
     let killed = invoke(dir.path(), &["kill", "box-0", "p1-0"]).await;
 

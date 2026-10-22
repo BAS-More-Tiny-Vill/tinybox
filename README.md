@@ -114,7 +114,7 @@ workspace:  alpine:3
 runner:     local / docker
 isolation:  kernel
 untrusted:  safe
-supports:   filesystem snapshots, forking, resource limits
+supports:   filesystem snapshots, forking
 ```
 
 Snapshot a box and branch it — the fork inherits the parent's filesystem and
@@ -363,30 +363,29 @@ tinybox where a bug is a command-injection bug.
 
 ## Releasing
 
-Run the **Release** workflow from the Actions tab with a `patch`, `minor`, or
-`major` bump; use `current` only to resume an interrupted release whose version
-commit and tag already exist. The workflow revalidates the workspace, versions
-and tags it, builds `tinybox-module` as a TinyBus `cdylib`, and creates a GitHub
-release.
+Update the workspace versions, local dependency constraints, and lockfile in a
+reviewed pull request. After it merges to `main`, create the matching `v<version>`
+tag on that commit. The **Release** workflow runs on the tag; its manual input
+accepts an existing tag when retrying a release.
 
-Assets follow `tinybox-<version>-<platform>.<tar.gz|zip>` and contain the native
-module, its SHA-256 `modules.toml`, the license, and [`MODULE.md`](MODULE.md).
-Every release also publishes `checksum.toml`, which TinyBus uses to verify an
-archive before extraction. The workflow loads the published Ubuntu archive
-through TinyBus's GitHub release API and calls `Describe` before declaring the
-release successful.
+The shared release workflow builds and verifies 17 native archives across
+Linux, macOS, and Windows. Assets follow
+`tinybox-<version>-<platform>.<tar.gz|zip>` and contain the native module,
+its SHA-256 `modules.toml`, license, and [`MODULE.md`](MODULE.md).
+`checksum.toml` records the archive hashes. Verification loads each native module
+through TinyBus and calls `Describe` before publishing the immutable release.
 
 TinyBus itself is not shipped here; the pinned submodule is the build-time SDK.
-The native matrix covers Ubuntu 22.04 and 24.04, Fedora 43 and 44, and rolling
-Arch Linux; macOS 15 and 26 on Intel and Apple Silicon; Windows Server 2022 and
-2025 on x86_64; and Windows 11 on ARM64. Do not hand-edit the version in
-`Cargo.toml` — the workflow owns it.
 
 ## Documentation
 
+- [Serialized module contract](crates/tinybox-module/src/tinybus_module/README.md)
+  — the TinyBus methods and lifecycle semantics
 - [`docs/specs/tinybox-runtime.md`](docs/specs/tinybox-runtime.md) — the runtime
   specification: the model, the capability contract, and the adopted
   optimizations
+- [`docs/specs/constraint-preflight.md`](docs/specs/constraint-preflight.md) —
+  hard preflight and current backend limitations
 - [`docs/adr/`](docs/adr/0001-record-architecture-decisions.md) — architecture
   decision records, including [why backends drive a CLI through the `Host`
   trait](docs/adr/0004-drive-backends-through-the-host-trait.md)
@@ -398,3 +397,10 @@ Arch Linux; macOS 15 and 26 on Intel and Apple Silicon; Windows Server 2022 and
 ## License
 
 GPL-3.0-only. See [LICENSE](LICENSE).
+
+## Scope
+
+tinybox is sandbox-only. It enforces the confinement a caller asks for (filesystem,
+network, processes, resources), reports observational events, and refuses what it
+cannot enforce. It owns no policy, approval, audit or command-classification logic;
+that is `tinysecurity`. See `docs/specs/contract-1-19.md`.
