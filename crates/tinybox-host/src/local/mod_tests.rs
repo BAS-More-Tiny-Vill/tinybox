@@ -25,7 +25,7 @@ async fn it_runs_a_command_and_captures_stdout() -> Result<()> {
     assert!(output.succeeded());
     assert_eq!(output.exit_code, 0);
     assert_eq!(output.stdout_lossy().trim(), "hello");
-    assert_eq!(output.stderr, [] as [u8; 0]);
+    assert_eq!(output.stderr.len(), 0);
     Ok(())
 }
 
@@ -95,8 +95,12 @@ async fn it_runs_in_the_requested_directory() -> Result<()> {
         .canonicalize()
         .map_err(|error| Error::io("canonicalize", &error))?;
 
+    #[cfg(windows)]
+    let cwd_command = ExecRequest::new(["cmd.exe", "/D", "/C", "cd"]);
+    #[cfg(not(windows))]
+    let cwd_command = ExecRequest::new(["pwd"]);
     let output = LocalHost::new()
-        .run(&ExecRequest::new(["pwd"]).with_cwd(dir.path()))
+        .run(&cwd_command.with_cwd(dir.path()))
         .await?;
 
     assert_eq!(
@@ -137,7 +141,7 @@ async fn the_child_inherits_the_parent_environment() -> Result<()> {
         .run(&ExecRequest::new(["sh", "-c", "printf %s \"$PATH\""]))
         .await?;
 
-    assert_ne!(output.stdout, [] as [u8; 0]);
+    assert_ne!(output.stdout.len(), 0);
     Ok(())
 }
 
@@ -160,7 +164,7 @@ async fn a_child_reading_stdin_does_not_hang() -> Result<()> {
     let output = LocalHost::new().run(&ExecRequest::new(["cat"])).await?;
 
     assert!(output.succeeded());
-    assert_eq!(output.stdout, [] as [u8; 0]);
+    assert_eq!(output.stdout.len(), 0);
     Ok(())
 }
 
@@ -278,5 +282,47 @@ async fn a_local_forward_is_the_address_itself() -> Result<()> {
 
     assert_eq!(forwarded.local_addr(), ([127, 0, 0, 1], 7788).into());
     assert!(forwarded.is_direct());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn dropping_the_owned_child_stops_the_local_workload() -> Result<()> {
+    let mut command = LocalHost::command(&ExecRequest::new(["sleep", "600"]))?;
+    let child = command
+        .spawn()
+        .map_err(|error| Error::io("spawn test child", &error))?;
+    let pid = child
+        .id()
+        .ok_or_else(|| Error::EmptyCommand {
+            sandbox: NAME.into(),
+        })?
+        .to_string();
+    drop(child);
+    let stopped = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let probe = LocalHost::new()
+                .run(&ExecRequest::new(["ps", "-o", "stat=", "-p", &pid]))
+                .await?;
+            let state = probe.stdout_lossy();
+            if state.trim().is_empty()
+                || state.trim_start().starts_with('Z')
+                || state.trim_start().starts_with('X')
+            {
+                return Ok::<(), Error>(());
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    if stopped.is_err() {
+        LocalHost::new()
+            .run(&ExecRequest::new(["kill", "-KILL", &pid]))
+            .await?;
+    }
+    assert!(
+        stopped.is_ok(),
+        "dropping the owned child must kill the workload"
+    );
     Ok(())
 }

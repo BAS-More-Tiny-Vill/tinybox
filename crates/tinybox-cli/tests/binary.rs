@@ -56,17 +56,18 @@ fn a_box_is_created_used_and_destroyed_through_the_binary() -> io::Result<()> {
 
     let removed = tinybox(state.path(), &["rm", "box-0"])?;
     assert!(removed.status.success());
-    assert_eq!(stdout(&tinybox(state.path(), &["ls"])?), "");
+    assert_eq!(stdout(&tinybox(state.path(), &["ls"])?).len(), 0);
     Ok(())
 }
 
 #[test]
 fn the_command_exit_status_becomes_the_process_exit_status() -> io::Result<()> {
     let state = TempDir::new()?;
+    let workspace_path = state.path().display().to_string();
 
     let executed = tinybox(
         state.path(),
-        &["run", "--dir", "/tmp", "sh", "-c", "exit 9"],
+        &["run", "--dir", &workspace_path, "sh", "-c", "exit 9"],
     )?;
 
     // A code that is not forwarded shows up here and nowhere else.
@@ -77,10 +78,11 @@ fn the_command_exit_status_becomes_the_process_exit_status() -> io::Result<()> {
 #[test]
 fn output_survives_being_piped() -> io::Result<()> {
     let state = TempDir::new()?;
+    let workspace_path = state.path().display().to_string();
 
     let executed = tinybox(
         state.path(),
-        &["run", "--dir", "/tmp", "sh", "-c", "echo piped"],
+        &["run", "--dir", &workspace_path, "sh", "-c", "echo piped"],
     )?;
 
     // Not a terminal, so stdout is block-buffered; this fails if `main` exits
@@ -93,6 +95,7 @@ fn output_survives_being_piped() -> io::Result<()> {
 #[test]
 fn a_tinybox_failure_is_distinguishable_from_a_command_failure() -> io::Result<()> {
     let state = TempDir::new()?;
+    let workspace_path = state.path().display().to_string();
 
     let missing = tinybox(state.path(), &["exec", "box-9", "true"])?;
     assert_eq!(missing.status.code(), Some(70));
@@ -100,7 +103,7 @@ fn a_tinybox_failure_is_distinguishable_from_a_command_failure() -> io::Result<(
 
     let failed = tinybox(
         state.path(),
-        &["run", "--dir", "/tmp", "sh", "-c", "exit 1"],
+        &["run", "--dir", &workspace_path, "sh", "-c", "exit 1"],
     )?;
     assert_eq!(failed.status.code(), Some(1));
     Ok(())
@@ -124,13 +127,14 @@ fn help_reaches_stdout_and_names_every_command() -> io::Result<()> {
 #[test]
 fn the_default_store_location_is_used_when_none_is_given() -> io::Result<()> {
     let state = TempDir::new()?;
+    let workspace_path = state.path().display().to_string();
 
     // No `--store`, so the path comes from the environment. Setting it on the
     // child avoids mutating this process's own environment, which would need
     // `unsafe` in Rust 2024.
     let created = Command::new(env!("CARGO_BIN_EXE_tinybox"))
         .env("TINYBOX_STATE_DIR", state.path())
-        .args(["create", "--dir", "/tmp"])
+        .args(["create", "--dir", &workspace_path])
         .output()?;
 
     assert!(created.status.success(), "{}", stderr(&created));

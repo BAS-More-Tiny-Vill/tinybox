@@ -1,7 +1,12 @@
 //! Running commands on the machine tinybox is running on.
 
+pub(crate) mod shell;
+
 use async_trait::async_trait;
-use tinybox_core::{Error, ExecOutput, ExecRequest, Forward, Host, Result};
+use std::path::Path;
+use tinybox_core::{
+    Error, ExecOutput, ExecRequest, Forward, Host, Result, WorkspaceFileReader, WorkspaceFileWriter,
+};
 use tokio::io::AsyncWriteExt as _;
 use tokio::process::Command;
 
@@ -36,12 +41,13 @@ impl LocalHost {
     /// # Errors
     ///
     /// Returns [`Error::EmptyCommand`] when the request names no program.
-    fn command(request: &ExecRequest) -> Result<Command> {
+    pub(super) fn command(request: &ExecRequest) -> Result<Command> {
         let program = request.program().ok_or_else(|| Error::EmptyCommand {
             sandbox: NAME.to_owned(),
         })?;
 
         let mut command = Command::new(program);
+        command.kill_on_drop(true);
         command.args(&request.argv[1..]);
         command.envs(&request.env);
         if let Some(cwd) = &request.cwd {
@@ -111,6 +117,23 @@ impl Host for LocalHost {
             .await
             .map_err(|error| Error::io("wait", &error))?;
         Ok(Self::collect(&output))
+    }
+
+    async fn open_workspace_file(
+        &self,
+        root: &Path,
+        relative: &Path,
+    ) -> Result<Box<dyn WorkspaceFileReader>> {
+        crate::files::open_reader(root, relative)
+    }
+
+    async fn begin_workspace_file_write(
+        &self,
+        root: &Path,
+        relative: &Path,
+        transfer_id: &str,
+    ) -> Result<Box<dyn WorkspaceFileWriter>> {
+        crate::files::begin_writer(root, relative, transfer_id)
     }
 
     /// Hand the address straight back.

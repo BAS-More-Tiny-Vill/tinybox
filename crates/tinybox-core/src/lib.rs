@@ -65,6 +65,7 @@ pub mod capability;
 pub mod clock;
 pub mod detach;
 pub mod error;
+pub mod event;
 pub mod identity;
 pub mod passthrough;
 pub mod runtime;
@@ -73,16 +74,22 @@ pub mod spec;
 pub mod store;
 pub mod template;
 
+pub mod constraint;
+pub use constraint::{Constraint, ConstraintSupport, Enforcement, PlanCheck};
+
 pub use capability::{Capability, IsolationLevel, SandboxCapabilities, SnapshotSupport};
 pub use clock::{Clock, SystemClock};
 pub use error::{Error, Result};
+pub use event::{CollectingSink, DenialKind, EventSink, LimitKind, SandboxEvent};
 pub use identity::{BoxId, HostRef, ProcessId, SandboxRef, SnapshotId, TemplateName};
 pub use passthrough::PassthroughSandbox;
 pub use runtime::{
-    BoxInfo, BoxState, ExecOutput, ExecRequest, Forward, ForwardGuard, Host, Sandbox,
+    BoxInfo, BoxState, ExecOutput, ExecRequest, ExecutionObserver, Forward, ForwardGuard, Host,
+    OutputStream, Sandbox, WorkspaceFileReader, WorkspaceFileWriter,
 };
 pub use spec::{
-    BoxSpec, Lifecycle, NetworkPolicy, Placement, PortMapping, Resources, WorkspaceSource,
+    BoxSpec, EgressAllowlist, Lifecycle, NetworkPolicy, Placement, PortMapping, Resources,
+    WorkspaceSource,
 };
 pub use store::{MemoryStore, Store, insert_new};
 pub use template::{MemoryTemplates, Templates};

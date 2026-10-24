@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use tinybox_core::{Error, ExecOutput, ExecRequest, Forward, Host, Result};
 
 mod forward;
+mod observed;
 mod target;
 
 pub use target::SshTarget;
@@ -37,13 +38,18 @@ pub const NAME: &str = "ssh";
 pub struct SshHost {
     inner: Arc<dyn Host>,
     target: SshTarget,
+    observed_cleanup: observed::RemoteCleanupState,
 }
 
 impl SshHost {
     /// Reach `target` by running `ssh` on `inner`.
     #[must_use]
     pub fn new(inner: Arc<dyn Host>, target: SshTarget) -> Self {
-        Self { inner, target }
+        Self {
+            inner,
+            target,
+            observed_cleanup: observed::RemoteCleanupState::default(),
+        }
     }
 
     /// Where this host connects to.
@@ -76,6 +82,102 @@ impl SshHost {
             &request.env,
         ));
         Ok(argv)
+    }
+
+    async fn run_observed_owned(
+        &self,
+        request: &ExecRequest,
+        observer: Arc<dyn tinybox_core::ExecutionObserver>,
+    ) -> Result<ExecOutput> {
+        let support = self
+            .inner
+            .run(&observed::supports_process_groups(&self.target))
+            .await?;
+        if support.exit_code == 255 {
+            return Err(Error::Backend {
+                sandbox: NAME.to_owned(),
+                operation: "check remote streaming support",
+                message: "SSH transport failed".to_owned(),
+            });
+        }
+        if support.exit_code != 0 {
+            return Err(observed::unsupported_process_groups());
+        }
+
+        let (id, directory) = self.observed_cleanup.reserve();
+        let _reservation_guard = self.observed_cleanup.reserve_guard(id.clone());
+        let prepared = observed::prepare_request(&self.target, &id, &directory);
+        let prepared_output = match self.inner.run(&prepared).await {
+            Ok(output) => output,
+            Err(error) => {
+                return match self
+                    .inner
+                    .run(&observed::cleanup_request(
+                        &self.target,
+                        &id,
+                        &directory,
+                        true,
+                    ))
+                    .await
+                {
+                    Ok(output) if observed::cleanup_result(&output).is_ok() => {
+                        self.observed_cleanup.remove(&id);
+                        Err(error)
+                    }
+                    _ => {
+                        self.observed_cleanup.mark_pending(&id);
+                        Err(Error::ObservedCleanupPending {
+                            provider: NAME.to_owned(),
+                        })
+                    }
+                };
+            }
+        };
+        if prepared_output.exit_code != 0 || prepared_output.stdout != b"ready\n" {
+            let cleanup = observed::cleanup_request(&self.target, &id, &directory, true);
+            return match self.inner.run(&cleanup).await {
+                Ok(output) if observed::cleanup_result(&output).is_ok() => {
+                    self.observed_cleanup.remove(&id);
+                    Err(Error::Backend {
+                        sandbox: NAME.to_owned(),
+                        operation: "reserve remote execution cleanup",
+                        message: "remote cleanup reservation failed".to_owned(),
+                    })
+                }
+                _ => {
+                    self.observed_cleanup.mark_pending(&id);
+                    Err(Error::ObservedCleanupPending {
+                        provider: NAME.to_owned(),
+                    })
+                }
+            };
+        }
+        let forwarded = match observed::request(&self.target, request, &id, &directory) {
+            Ok(forwarded) => forwarded,
+            Err(error) => {
+                self.observed_cleanup.remove(&id);
+                return Err(error);
+            }
+        };
+        let bridge = observed::Bridge::new(
+            observer,
+            self.inner.clone(),
+            self.target.clone(),
+            self.observed_cleanup.clone(),
+            id.clone(),
+            directory,
+        );
+        let result = self.inner.run_observed(&forwarded, bridge.clone()).await;
+        // The remote wrapper leaves its private directory for the owner to
+        // reap after the process-group leader has been joined.
+        if let Err(cleanup_error) = bridge.cleanup_finished().await {
+            self.observed_cleanup.mark_pending(&id);
+            return Err(cleanup_error);
+        }
+        if let Some(output_error) = bridge.take_output_error() {
+            return Err(output_error);
+        }
+        result
     }
 }
 
@@ -112,6 +214,61 @@ impl Host for SshHost {
             forwarded = forwarded.with_stdin(stdin.clone());
         }
         self.inner.run(&forwarded).await
+    }
+
+    /// Stream remote stdout and stderr while retaining a remote process-group
+    /// cleanup handle until command completion is confirmed.
+    async fn run_observed(
+        &self,
+        request: &ExecRequest,
+        observer: Arc<dyn tinybox_core::ExecutionObserver>,
+    ) -> Result<ExecOutput> {
+        if request.argv.is_empty() {
+            return Err(Error::EmptyCommand {
+                sandbox: NAME.to_owned(),
+            });
+        }
+        let host = self.clone();
+        let request = request.clone();
+        tokio::spawn(async move { host.run_observed_owned(&request, observer).await })
+            .await
+            .map_err(|error| Error::Backend {
+                sandbox: NAME.to_owned(),
+                operation: "supervise observed SSH execution",
+                message: error.to_string(),
+            })?
+    }
+
+    fn has_pending_observed_cleanup(&self) -> bool {
+        self.observed_cleanup.has_pending() || self.inner.has_pending_observed_cleanup()
+    }
+
+    async fn retry_observed_cleanup(&self) -> Result<()> {
+        let mut first_error = None;
+        for (id, directory) in self.observed_cleanup.pending() {
+            let result =
+                async {
+                    let request = observed::cleanup_request(&self.target, &id, &directory, true);
+                    let output = self.inner.run(&request).await.map_err(|_| {
+                        Error::ObservedCleanupPending {
+                            provider: NAME.to_owned(),
+                        }
+                    })?;
+                    observed::cleanup_result(&output)
+                }
+                .await;
+            match result {
+                Ok(()) => self.observed_cleanup.remove(&id),
+                Err(error) => {
+                    self.observed_cleanup.mark_pending(&id);
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        if let Err(error) = self.inner.retry_observed_cleanup().await {
+            first_error.get_or_insert(error);
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     /// Open a tunnel from this machine to `remote` on the far machine.
@@ -159,3 +316,7 @@ const LOCAL_HOST_NAME: &str = "local";
 #[cfg(test)]
 #[path = "mod_tests.rs"]
 mod test;
+
+#[cfg(test)]
+#[path = "observed_tests.rs"]
+mod observed_tests;

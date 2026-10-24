@@ -1,0 +1,511 @@
+//! Owned detached handles acknowledge cleanup and reclaim native tasks.
+use super::*;
+#[cfg(windows)]
+use tinybox_core::Host;
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cleanup_failures_are_retained_and_never_acknowledged_as_success() -> Result<()> {
+    let task = tokio::spawn(async {
+        Err(Error::Backend {
+            sandbox: crate::LOCAL.into(),
+            operation: "cleanup",
+            message: "injected native failure".into(),
+        })
+    });
+    let mut process = ManagedProcess {
+        cancel: None,
+        task: Some(task),
+        terminal: Ok(()),
+        cleanup_failed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        state: LimitedLocalHost::new(100).state,
+        group: 0,
+        supervisor_failed: true,
+    };
+    assert!(process.stop().await.is_err());
+    assert!(process.stop().await.is_err());
+    let task = tokio::spawn(std::future::pending::<Result<()>>());
+    task.abort();
+    let mut process = ManagedProcess {
+        cancel: None,
+        task: Some(task),
+        terminal: Ok(()),
+        cleanup_failed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        state: LimitedLocalHost::new(100).state,
+        group: 0,
+        supervisor_failed: true,
+    };
+    assert!(process.stop().await.is_err());
+    assert!(
+        cleanup_deadline(std::time::Duration::ZERO, std::future::pending())
+            .await
+            .is_err()
+    );
+    assert!(
+        wait_group(1, std::time::Duration::ZERO, |_| async { Ok(true) })
+            .await
+            .is_err()
+    );
+    assert!(
+        wait_group(1, std::time::Duration::from_secs(5), |_| async {
+            Err(Error::Backend {
+                sandbox: crate::LOCAL.into(),
+                operation: "observe group",
+                message: "injected failure".into(),
+            })
+        })
+        .await
+        .is_err()
+    );
+    #[cfg(target_os = "linux")]
+    assert!(group_alive(nix::unistd::getpgrp().as_raw()).await?);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn detached_stop_and_drop_join_supervised_children() -> Result<()> {
+    let host = LimitedLocalHost::new(100);
+    let mut process = host.spawn(&ExecRequest::new(["sleep", "600"]))?;
+    assert!(process.is_running());
+    process.stop().await?;
+    process.stop().await?;
+    assert!(!process.is_running());
+    let process = host.spawn(&ExecRequest::new(["sleep", "600"]))?;
+    drop(process);
+    host.drain().await;
+    assert_eq!(host.state.active.load(Ordering::SeqCst), 0);
+    let mut finished = host.spawn(&ExecRequest::new(["cat"]).with_stdin(b"input".to_vec()))?;
+    host.drain().await;
+    assert!(!finished.is_running());
+    finished.stop().await?;
+    assert!(host.spawn(&ExecRequest::new(Vec::<String>::new())).is_err());
+    assert!(
+        host.spawn(&ExecRequest::new(["/nonexistent/tinybox-program"]))
+            .is_err()
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn unowned_native_child_is_killed_and_reaped() -> Result<()> {
+    let mut command = Command::new("sleep");
+    command.arg("600");
+    prepare(&mut command)?;
+    let mut child = command
+        .spawn()
+        .map_err(|error| Error::io("spawn cleanup fixture", &error))?;
+    assert!(child.id().is_some());
+
+    kill_unowned(&mut child)
+        .await
+        .map_err(|error| Error::io("kill unowned fixture", &error))?;
+
+    assert!(child.id().is_none(), "cleanup must reap the unowned child");
+    Ok(())
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn limited_host_runs_and_stops_a_windows_process_job() -> Result<()> {
+    let host = LimitedLocalHost::new(100);
+    let output = host
+        .run(&ExecRequest::new(["cmd.exe", "/C", "echo tinybox"]))
+        .await?;
+    assert_eq!(output.exit_code, 0);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("tinybox"));
+
+    let mut process = host.spawn(&ExecRequest::new([
+        "powershell.exe",
+        "-NoProfile",
+        "-Command",
+        "Start-Sleep -Seconds 600",
+    ]))?;
+    assert!(process.is_running());
+    process.stop().await?;
+    assert!(process.is_cleaned());
+    host.drain_checked().await?;
+    assert_eq!(host.state.active.load(Ordering::SeqCst), 0);
+    Ok(())
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn stopping_a_windows_job_terminates_its_spawned_descendant() -> Result<()> {
+    let directory = tempfile::tempdir().map_err(|error| Error::io("tempdir", &error))?;
+    let pid_file = directory.path().join("descendant.pid");
+    let path = pid_file.to_string_lossy().replace('\'', "''");
+    let script = format!(
+        "$child = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-Command','Start-Sleep -Seconds 600') -PassThru; [System.IO.File]::WriteAllText('{path}', [string]$child.Id); Start-Sleep -Seconds 600"
+    );
+    let host = LimitedLocalHost::new(100);
+    let mut process = host.spawn(&ExecRequest::new([
+        "powershell.exe",
+        "-NoProfile",
+        "-Command",
+        &script,
+    ]))?;
+    let pid = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if let Ok(contents) = std::fs::read_to_string(&pid_file)
+                && let Ok(pid) = contents.parse::<u32>()
+            {
+                break pid;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .map_err(|error| Error::Backend {
+        sandbox: crate::LOCAL.into(),
+        operation: "await descendant readiness",
+        message: error.to_string(),
+    })?;
+
+    process.stop().await?;
+    host.drain_checked().await?;
+    let check = host
+        .run(&ExecRequest::new([
+            "powershell.exe",
+            "-NoProfile",
+            "-Command",
+            &format!(
+                "if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ exit 1 }} else {{ exit 0 }}"
+            ),
+        ]))
+        .await?;
+    assert_eq!(
+        check.exit_code, 0,
+        "descendant process {pid} is still alive"
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn a_windows_parent_exit_reclaims_its_detached_descendant_without_explicit_stop() -> Result<()>
+{
+    let directory = tempfile::tempdir().map_err(|error| Error::io("tempdir", &error))?;
+    let pid_file = directory.path().join("descendant.pid");
+    let path = pid_file.to_string_lossy().replace('\'', "''");
+    let script = format!(
+        "$child = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-Command','Start-Sleep -Seconds 600') -PassThru; [System.IO.File]::WriteAllText('{path}', [string]$child.Id); exit 0"
+    );
+    let host = LimitedLocalHost::new(100);
+    let mut process = host.spawn(&ExecRequest::new([
+        "powershell.exe",
+        "-NoProfile",
+        "-Command",
+        &script,
+    ]))?;
+    let completed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while process.is_running() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    // Always drain the fixture, including the unfixed path that times out.
+    process.stop().await?;
+    host.drain_checked().await?;
+    assert!(
+        completed.is_ok(),
+        "parent exit must finish supervision without waiting for its descendant"
+    );
+    let pid = std::fs::read_to_string(pid_file)
+        .map_err(|error| Error::io("read descendant readiness", &error))?
+        .parse::<u32>()
+        .map_err(|error| Error::Backend {
+            sandbox: crate::LOCAL.into(),
+            operation: "read descendant pid",
+            message: error.to_string(),
+        })?;
+    let check = host.run(&ExecRequest::new([
+        "powershell.exe", "-NoProfile", "-Command",
+        &format!("if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ exit 1 }} else {{ exit 0 }}"),
+    ])).await?;
+    assert_eq!(
+        check.exit_code, 0,
+        "descendant process {pid} is still alive"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn stop_reports_a_nonzero_terminal_command_status() -> Result<()> {
+    let host = LimitedLocalHost::new(100);
+    let mut process = host.spawn(&ExecRequest::new(["sh", "-c", "exit 7"]))?;
+    host.drain().await;
+    assert!(process.stop().await.is_err());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cleanup_accepts_an_already_reaped_empty_process_group() -> Result<()> {
+    let mut command = Command::new("true");
+    prepare(&mut command)?;
+    let mut child = command
+        .spawn()
+        .map_err(|error| Error::io("spawn", &error))?;
+    let process_group = group(&child)?;
+    child
+        .wait()
+        .await
+        .map_err(|error| Error::io("wait", &error))?;
+    assert!(!group_alive(process_group).await?);
+    terminate(&mut child, process_group).await?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn terminate_kills_and_reaps_its_child_process_group() -> Result<()> {
+    let mut command = Command::new("sleep");
+    command.arg("600");
+    prepare(&mut command)?;
+    let mut child = command
+        .spawn()
+        .map_err(|error| Error::io("spawn", &error))?;
+    let process_group = group(&child)?;
+
+    terminate(&mut child, process_group).await?;
+
+    assert!(child.id().is_none());
+    assert!(!group_alive(process_group).await?);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn stop_retries_cleanup_for_a_retained_native_child() -> Result<()> {
+    let host = LimitedLocalHost::new(100);
+    let mut command = Command::new("sleep");
+    command.arg("600");
+    prepare(&mut command)?;
+    let child = command
+        .spawn()
+        .map_err(|error| Error::io("spawn", &error))?;
+    let process_group = group(&child)?;
+    let retained = std::sync::Arc::new(tokio::sync::Mutex::new(Some(child)));
+    host.state
+        .cleanup_failures
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(process_group, retained.clone());
+    let mut process = ManagedProcess {
+        cancel: None,
+        task: None,
+        terminal: Err("cleanup pending".into()),
+        cleanup_failed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        state: host.state.clone(),
+        group: process_group,
+        supervisor_failed: false,
+    };
+
+    process.stop().await?;
+
+    assert!(retained.lock().await.is_none());
+    assert!(!host.has_pending_cleanup());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn group_kill_failures_are_reported_without_signalling_a_process() {
+    let result = kill_group_with(1, |_| Err(nix::errno::Errno::EPERM));
+
+    assert!(matches!(
+        result,
+        Err(Error::Backend {
+            operation: "kill process group",
+            ..
+        })
+    ));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn proc_stat_group_parser_handles_parentheses_and_malformed_rows() {
+    assert!(stat_has_live_group("123 (command ) name) S 1 42 42 0", 42));
+    assert!(!stat_has_live_group("malformed process row", 42));
+    assert!(!stat_has_live_group("123 (zombie) Z 1 42 42 0", 42));
+    assert!(!stat_has_live_group("123 (other group) S 1 43 43 0", 42));
+}
+
+#[test]
+fn spawn_outside_a_tokio_runtime_returns_an_error() {
+    let host = LimitedLocalHost::new(100);
+    assert!(host.spawn(&ExecRequest::new(["sleep", "600"])).is_err());
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn stopping_a_shell_reaps_the_direct_child_and_terminates_its_descendant() -> Result<()> {
+    let directory = tempfile::tempdir().map_err(|error| Error::io("tempdir", &error))?;
+    let ready = directory.path().join("pids");
+    let script = format!(
+        "sleep 600 & echo $$ $! > {}; wait",
+        tinybox_core::shell::quote(&ready.to_string_lossy())
+    );
+    let host = LimitedLocalHost::new(100);
+    let mut process = host.spawn(&ExecRequest::new(["sh", "-c", &script]))?;
+    let pids = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Ok(contents) = std::fs::read_to_string(&ready)
+                && contents.split_whitespace().count() == 2
+            {
+                break contents;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|error| Error::Backend {
+        sandbox: crate::LOCAL.into(),
+        operation: "await readiness",
+        message: error.to_string(),
+    })?;
+    process.stop().await?;
+    for (index, pid) in pids.split_whitespace().enumerate() {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status"));
+        if index == 0 {
+            assert!(status.is_err(), "direct child was not reaped");
+        } else if let Ok(status) = status {
+            assert!(
+                status
+                    .lines()
+                    .find(|line| line.starts_with("State:"))
+                    .is_some_and(|line| line.contains("Z (zombie)")),
+                "descendant still executes after cleanup"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn retained_native_cleanup_failure_is_retried_by_managed_stop() -> Result<()> {
+    let host = LimitedLocalHost::new(100);
+    let mut command = crate::LocalHost::command(&ExecRequest::new(["sleep", "600"]))?;
+    prepare(&mut command)?;
+    let child = command
+        .spawn()
+        .map_err(|error| Error::io("fixture spawn", &error))?;
+    let group = group(&child)?;
+    #[cfg(target_os = "linux")]
+    let pid = child.id().ok_or_else(|| Error::Backend {
+        sandbox: crate::LOCAL.into(),
+        operation: "fixture pid",
+        message: "missing".into(),
+    })?;
+    host.state
+        .cleanup_failures
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(
+            group,
+            std::sync::Arc::new(tokio::sync::Mutex::new(Some(child))),
+        );
+    let mut process = ManagedProcess {
+        cancel: None,
+        task: None,
+        terminal: Err("transient native error".into()),
+        cleanup_failed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        state: host.state.clone(),
+        group,
+        supervisor_failed: false,
+    };
+    assert!(!process.is_cleaned());
+    process.stop().await?;
+    assert!(process.is_cleaned());
+    process.stop().await?;
+    #[cfg(target_os = "linux")]
+    assert!(!std::path::Path::new(&format!("/proc/{pid}/status")).exists());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn process_table_ignores_zombies_but_keeps_live_group_members() {
+    assert!(!ps_has_live_group(" 42 Z\n 43 S\n", 42));
+    assert!(ps_has_live_group(" 42 Z\n 42 S+\n", 42));
+    assert!(!ps_has_live_group("bad row\n42\n", 42));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn permission_error_after_group_exit_is_successful_cleanup() -> Result<()> {
+    kill_group_checked(
+        42,
+        |_| Err(nix::errno::Errno::EPERM),
+        |_| async { Ok(false) },
+    )
+    .await?;
+    assert!(
+        kill_group_checked(
+            42,
+            |_| Err(nix::errno::Errno::EPERM),
+            |_| async { Ok(true) }
+        )
+        .await
+        .is_err()
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn stalled_process_table_probe_is_killed_and_reaped_at_its_deadline() -> Result<()> {
+    let mut child = Command::new("sleep")
+        .arg("600")
+        .kill_on_drop(true)
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|error| Error::io("spawn probe fixture", &error))?;
+    let result = process_table_output(&mut child, std::time::Duration::from_millis(1)).await;
+    assert!(matches!(
+        result.err(),
+        Some(Error::Backend {
+            operation: "read process table",
+            ..
+        })
+    ));
+    assert!(
+        child.id().is_none(),
+        "expired probe must be killed and reaped"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn process_table_probe_collects_output_and_rejects_missing_pipe() -> Result<()> {
+    let mut child = Command::new("sh")
+        .args(["-c", "printf '42 S\\n'"])
+        .kill_on_drop(true)
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|error| Error::io("spawn probe fixture", &error))?;
+    let output = process_table_output(&mut child, std::time::Duration::from_secs(5)).await?;
+    assert!(output.status.success());
+    assert!(ps_has_live_group(
+        &String::from_utf8_lossy(&output.stdout),
+        42
+    ));
+    let mut child = Command::new("true")
+        .spawn()
+        .map_err(|error| Error::io("spawn probe fixture", &error))?;
+    assert!(
+        process_table_output(&mut child, std::time::Duration::from_secs(5))
+            .await
+            .is_err()
+    );
+    child
+        .wait()
+        .await
+        .map_err(|error| Error::io("reap probe fixture", &error))?;
+    Ok(())
+}

@@ -4,11 +4,16 @@ Thanks for contributing. The best changes here are small, explicit, tested, and
 easy to review. [`AGENTS.md`](AGENTS.md) holds the full repository guidelines —
 this document is the short path through them.
 
+## Shared Module CI and Releases
+
+This repository follows the shared module CI and release contract maintained in
+[tinyhumansai/.github](https://github.com/tinyhumansai/.github/blob/main/docs/module-ci-contract.md).
+
 ## Development Setup
 
 Install a stable Rust toolchain with Rust 2024 support (see `rust-version` in
 `Cargo.toml` for the minimum supported version), initialize the vendored
-submodules, then run the four checks CI runs:
+submodules, then run these baseline checks locally; the reusable CI workflow also runs the cross-platform module gates described above:
 
 ```sh
 git submodule update --init --recursive
@@ -95,3 +100,7 @@ shape they imply.
 
 Do not report vulnerabilities through public issues. Follow the process in
 [SECURITY.md](SECURITY.md).
+
+## Releasing
+
+Change the Cargo package versions through a reviewed PR. After it merges, tag that commit as vX.Y.Z and push the tag, or dispatch Release with an existing version tag. The shared release verifies the package version, builds and loads all 17 native and distro artifacts, and publishes their checksum manifest. Release does not push version bumps to main.

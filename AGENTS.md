@@ -42,6 +42,7 @@ crates/
 ├── tinybox-microvm/         # confinement: a Firecracker guest with its own kernel
 ├── tinybox-ssh/             # reach: another machine, over SSH
 ├── tinybox-sync/            # fingerprinting and workspace transfer
+├── tinybox-drivers/         # box records + jail index on the tinystoragedrivers ports (unpublished)
 ├── tinybox-cli/             # the `tinybox` binary
 └── tinybox-module/          # cdylib, TinyBus ABI v1  ->  libtinybox.so
     ├── src/lib.rs           # crate docs; the adapter itself is private
@@ -53,6 +54,16 @@ docs/
 ├── plans/                   # test-first implementation plans
 └── adr/                     # immutable architecture decision records
 ```
+
+## Scope: tinybox only sandboxes
+
+tinybox accepts a plan, enforces it, and reports events. It never decides what
+is allowed: approval, audit decisions, redaction and command classification
+belong to `tinysecurity`. A backend that cannot enforce a requested constraint
+refuses with `Unsupported`/`ConstraintNotEnforced` or reports `BestEffort`; it
+never degrades silently. Contract 2.0 removes TinyBox's command classifier,
+executor list, and environment guard. `tinybox_core::shell::scan` remains only
+for generic shell structure parsing; it makes no policy decisions.
 
 Every crate the spec names now exists. Do not scaffold an empty one; that is a
 placeholder.
@@ -281,23 +292,19 @@ explicitly declined with a reason.
 
 ## Releases
 
-Releases run from `.github/workflows/release.yml` via a manual
-`workflow_dispatch` with a `patch` / `minor` / `major` bump; `current` resumes
-an interrupted release after its version commit and tag exist. The workflow
-re-runs the full validation suite, computes the next version, updates
-`Cargo.toml` and `Cargo.lock`, commits and tags `vX.Y.Z`, builds the TinyBus
-module for every supported platform, pushes, and creates an immutable GitHub
-release with installable native packages.
+Releases use the canonical TinyHumans shared workflow. Update the package
+versions and matching local dependency constraints in a PR, regenerate the
+lockfiles, and merge only after the required shared CI checks pass. For a
+workspace using version.workspace, change its root workspace.package version.
 
-Consequently:
+Create and push a vX.Y.Z tag at the merged commit, or dispatch Release with
+an existing tag input. The workflow checks that the tagged commit is on main
+and that its module version matches the tag. It builds and verifies all 17
+native and distro archives before publishing the immutable GitHub release.
+Release never commits or pushes version bumps to main.
 
-- Do not hand-edit the `version` field in `[workspace.package]`; the release
-  workflow owns it, and every member inherits it.
-- Follow semantic versioning. Any change to the public surface that is not
-  purely additive is a breaking change and needs a major bump (pre-1.0: a minor
-  bump).
-- The module must be packageable for every release target — `main` should
-  always be green.
+Follow semantic versioning: breaking changes require a major bump, or a minor
+bump before 1.0. The module must remain packageable for every release target.
 
 ## Agent Working Agreement
 

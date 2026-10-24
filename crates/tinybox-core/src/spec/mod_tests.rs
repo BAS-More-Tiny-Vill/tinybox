@@ -200,3 +200,74 @@ fn every_workspace_source_is_expressible() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn allowlist_validation_rejects_malformed_and_metadata_hosts() {
+    use super::EgressAllowlist;
+    let ok = EgressAllowlist::new(["example.com"], [443]);
+    assert!(ok.validate().is_ok());
+    assert!(
+        EgressAllowlist::new(Vec::<String>::new(), [443])
+            .validate()
+            .is_err()
+    );
+    assert!(
+        EgressAllowlist::new(["example.com"], Vec::<u16>::new())
+            .validate()
+            .is_err()
+    );
+    assert!(
+        EgressAllowlist::new(["example.com"], [0])
+            .validate()
+            .is_err()
+    );
+    assert!(
+        EgressAllowlist::new(["*.example.com"], [443])
+            .validate()
+            .is_err()
+    );
+    for host in [
+        "169.254.169.254",
+        "[fd00:ec2::254]",
+        "Metadata.Google.Internal",
+    ] {
+        assert!(
+            EgressAllowlist::new([host], [80]).validate().is_err(),
+            "{host} must be refused"
+        );
+    }
+}
+
+#[test]
+fn allowlist_policy_allows_egress_but_open_is_highest_risk() {
+    use super::EgressAllowlist;
+    let policy = NetworkPolicy::Allowlist(EgressAllowlist::new(["example.com"], [443]));
+    assert!(policy.allows_egress());
+    assert!(!policy.is_highest_risk());
+    assert!(NetworkPolicy::Open.is_highest_risk());
+    assert!(!NetworkPolicy::Egress.is_highest_risk());
+}
+
+#[test]
+fn spec_validate_rejects_a_bad_allowlist() -> Result<()> {
+    use super::EgressAllowlist;
+    let spec = spec()?.with_network(NetworkPolicy::Allowlist(EgressAllowlist::default()));
+    assert!(spec.validate().is_err());
+    Ok(())
+}
+
+#[test]
+fn refuse_allowlist_is_a_typed_network_refusal() {
+    use super::EgressAllowlist;
+    let policy = NetworkPolicy::Allowlist(EgressAllowlist::new(["example.com"], [443]));
+    let result = policy.refuse_allowlist("docker");
+    assert!(matches!(
+        result,
+        Err(crate::Error::ConstraintNotEnforced {
+            constraint: crate::Constraint::Network,
+            enforcement: crate::Enforcement::Unsupported,
+            ..
+        })
+    ));
+    assert!(NetworkPolicy::Egress.refuse_allowlist("docker").is_ok());
+}

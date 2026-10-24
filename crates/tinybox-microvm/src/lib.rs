@@ -49,6 +49,7 @@
 //! ```
 
 mod cpio;
+pub mod kvm;
 mod sandbox;
 
 pub use sandbox::{GuestImage, MicroVmSandbox, NAME, WORKSPACE_MOUNT};

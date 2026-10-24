@@ -5,9 +5,11 @@ resolver = "3"
 # `tinybox-cli` are named in `docs/specs/tinybox-runtime.md` but are not
 # scaffolded until they do something — an empty crate is a placeholder.
 members = [
+    "crates/tinybox-bus",
     "crates/tinybox-cli",
     "crates/tinybox-core",
     "crates/tinybox-docker",
+    "crates/tinybox-drivers",
     "crates/tinybox-host",
     "crates/tinybox-jail",
     "crates/tinybox-linux",
@@ -23,7 +25,7 @@ members = [
 exclude = ["vendor"]
 
 [workspace.package]
-version = "0.1.15"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 license = "GPL-3.0-only"
@@ -35,13 +37,13 @@ categories = ["development-tools", "virtualization"]
 [workspace.dependencies]
 # TinyBus defines the message types, interface macro, and frozen module ABI used
 # by the bus adapter. Socket and CLI features are unnecessary here.
-tinybus = { version = "=0.1.2", default-features = false, features = [
+tinybus = { version = ">=0.1.3, <0.2", default-features = false, features = [
     "macros",
     "modules",
 ] }
 # The module-side SDK owns the isolated runtime and exports the ABI entrypoints
 # required by TinyBus's dynamic loader.
-tinybus-module = "=0.1.2"
+tinybus-module = ">=0.1.3, <0.2"
 
 # Derive macros for the crate-wide error type in `tinybox-core`.
 thiserror = "2"
@@ -56,14 +58,24 @@ serde_json = "1"
 # The model types are serializable; see `tinybox-core`'s dependency comment.
 serde = { version = "1", features = ["derive"] }
 # Internal path dependencies between workspace members.
-tinybox-core = { path = "crates/tinybox-core", version = "0.1.5" }
-tinybox-host = { path = "crates/tinybox-host", version = "0.1.5" }
-tinybox-jail = { path = "crates/tinybox-jail", version = "0.1.5" }
-tinybox-linux = { path = "crates/tinybox-linux", version = "0.1.5" }
-tinybox-microvm = { path = "crates/tinybox-microvm", version = "0.1.5" }
-tinybox-docker = { path = "crates/tinybox-docker", version = "0.1.5" }
-tinybox-ssh = { path = "crates/tinybox-ssh", version = "0.1.5" }
-tinybox-sync = { path = "crates/tinybox-sync", version = "0.1.5" }
+tinybox-bus = { path = "crates/tinybox-bus", version = "0.2.0" }
+tinybox-core = { path = "crates/tinybox-core", version = "0.2.0" }
+tinybox-host = { path = "crates/tinybox-host", version = "0.2.0" }
+tinybox-jail = { path = "crates/tinybox-jail", version = "0.2.0" }
+tinybox-linux = { path = "crates/tinybox-linux", version = "0.2.0" }
+tinybox-microvm = { path = "crates/tinybox-microvm", version = "0.2.0" }
+tinybox-docker = { path = "crates/tinybox-docker", version = "0.2.0" }
+tinybox-ssh = { path = "crates/tinybox-ssh", version = "0.2.0" }
+tinybox-sync = { path = "crates/tinybox-sync", version = "0.2.0" }
+# The storage ports only (no database client), by git tag so a host that vendors
+# tinystoragedrivers once can `[patch]` it. Used by `tinybox-drivers`.
+tinystoragedrivers-core = { version = "1.0.0", git = "https://github.com/tinyhumansai/tinystoragedrivers", tag = "v1.0.0" }
+# The module reaches the host's storage over the storage bus: the proxy yields
+# the same port traits a linked library gets. The client crate serves them in
+# tests.
+tinystoragedrivers-busproxy = { version = "1.0.0", git = "https://github.com/tinyhumansai/tinystoragedrivers", tag = "v1.0.0" }
+tinystoragedrivers-client = { version = "1.0.0", git = "https://github.com/tinyhumansai/tinystoragedrivers", tag = "v1.0.0" }
+tinybox-drivers = { path = "crates/tinybox-drivers", version = "0.2.0" }
 
 # Lints apply to every crate in the workspace via `[lints] workspace = true`.
 # CI runs clippy with `-D warnings`, so anything set to "warn" here fails CI.
@@ -104,3 +116,8 @@ strip = "debuginfo"
 [patch.crates-io]
 tinybus = { path = "vendor/tinybus/crates/tinybus" }
 tinybus-module = { path = "vendor/tinybus/crates/tinybus-module" }
+
+# tinystoragedrivers names tinybus by git rev; point that source at the same
+# vendored checkout so the module and the storage proxy share one `Connection`.
+[patch."https://github.com/tinyhumansai/tinybus"]
+tinybus = { path = "vendor/tinybus/crates/tinybus" }

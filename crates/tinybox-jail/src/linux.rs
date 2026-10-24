@@ -22,8 +22,8 @@
 //! directory (`~/.ssh`, `~/.aws`, ...), `/proc` and `/sys`, and `/tmp`. A host
 //! that wants a scratch directory grants it with `add_read_write`.
 //!
-//! Landlock does not gate the network or process creation, so `allow_net` and
-//! `allow_subprocess` are not enforced by this backend.
+//! This implementation does not install Landlock network rules or gate process
+//! creation. Network and subprocess denial requests are refused before spawn.
 //!
 //! # Failing closed on old kernels
 //!
@@ -92,6 +92,14 @@ impl LandlockBackend {
 }
 
 impl JailBackend for LandlockBackend {
+    fn implicit_grants(&self) -> Vec<std::path::PathBuf> {
+        SYSTEM_READ_PATHS
+            .iter()
+            .chain(DEVICE_PATHS)
+            .map(std::path::PathBuf::from)
+            .collect()
+    }
+
     fn name(&self) -> &'static str {
         LANDLOCK_BACKEND_NAME
     }
@@ -100,8 +108,30 @@ impl JailBackend for LandlockBackend {
         imp::kernel_supports_landlock()
     }
 
+    fn constraint_support(&self) -> tinybox_core::ConstraintSupport {
+        if self.is_available() {
+            tinybox_core::ConstraintSupport::NONE.with(
+                tinybox_core::Constraint::Filesystem,
+                tinybox_core::Enforcement::Enforced,
+            )
+        } else {
+            tinybox_core::ConstraintSupport::NONE
+        }
+    }
+
     fn spawn(&self, jail: &Jail, cmd: Command) -> io::Result<Child> {
-        imp::spawn(jail, cmd)
+        let requested: Vec<_> = jail
+            .constraints()
+            .into_iter()
+            .filter(|c| *c != tinybox_core::Constraint::Filesystem)
+            .collect();
+        self.constraint_support()
+            .require(self.name(), &requested)
+            .map_err(|error| io::Error::new(io::ErrorKind::Unsupported, error))?;
+        let mut jail = jail.clone();
+        jail.canonicalize()?;
+        jail.validate_denials(false, &self.implicit_grants())?;
+        imp::spawn(&jail, cmd)
     }
 }
 
@@ -150,7 +180,7 @@ mod imp {
     pub(super) fn kernel_supports_landlock() -> bool {
         Ruleset::default()
             .set_compatibility(CompatLevel::HardRequirement)
-            .handle_access(AccessFs::ReadFile)
+            .handle_access(writes() | reads())
             .and_then(Ruleset::create)
             .is_ok()
     }
@@ -285,9 +315,7 @@ mod imp {
 
 #[cfg(not(feature = "landlock"))]
 mod imp {
-    use std::fs::File;
     use std::io;
-    use std::os::fd::AsFd;
     use std::process::{Child, Command};
 
     use crate::jail::Jail;

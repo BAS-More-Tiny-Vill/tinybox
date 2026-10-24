@@ -1,0 +1,46 @@
+use super::*;
+use crate::NetworkPolicy;
+
+#[test]
+fn events_keep_their_wire_labels() -> Result<(), serde_json::Error> {
+    let denied = SandboxEvent::Denied {
+        kind: DenialKind::Network,
+        target: Some("169.254.169.254:80".into()),
+    };
+    assert_eq!(
+        serde_json::to_value(&denied)?,
+        serde_json::json!({"event":"denied","kind":"network","target":"169.254.169.254:80"})
+    );
+    assert_eq!(
+        serde_json::to_value(SandboxEvent::LimitHit {
+            limit: LimitKind::Pids
+        })?,
+        serde_json::json!({"event":"limit_hit","limit":"pids"})
+    );
+    assert_eq!(
+        serde_json::to_value(SandboxEvent::Started)?,
+        serde_json::json!({"event":"started"})
+    );
+    let exited: SandboxEvent = serde_json::from_value(serde_json::json!({"event":"exited"}))?;
+    assert_eq!(exited, SandboxEvent::Exited { status: None });
+    Ok(())
+}
+
+#[test]
+fn an_allowlist_policy_round_trips_and_old_policies_still_parse() -> Result<(), serde_json::Error> {
+    let policy = NetworkPolicy::Allowlist(EgressAllowlist {
+        hosts: vec!["example.com".into()],
+        ports: vec![443],
+    });
+    let value = serde_json::to_value(&policy)?;
+    assert_eq!(
+        value,
+        serde_json::json!({"Allowlist":{"hosts":["example.com"],"ports":[443]}})
+    );
+    assert_eq!(serde_json::from_value::<NetworkPolicy>(value)?, policy);
+    assert_eq!(
+        serde_json::from_value::<NetworkPolicy>(serde_json::json!("Egress"))?,
+        NetworkPolicy::Egress
+    );
+    Ok(())
+}

@@ -205,6 +205,26 @@ composition in M4. ADR 0004 records the tradeoff.
 | Network | `Denied` → `--network none`. Docker has no outbound-only mode, so `Egress` uses the default bridge; nothing is published inbound because tinybox never passes `--publish`. |
 | State | Read from `docker inspect`, not from the store. A container can be stopped or removed by anything with daemon access, and reporting a stale `ready` would send commands to a box that is gone. Docker's `running` maps to `Ready`, because a tinybox box is `Running` only while a command executes and the keepalive loop is not a command. |
 
+`Sandbox::exec_observed` runs `docker exec -i` through the same `Host`, so
+stdout and stderr remain separate byte streams and request stdin, cwd, and
+environment are preserved. The image also needs `setsid` in addition to `sh`:
+Docker starts the requested argv in its own process group while an outer
+container-side waiter retains ownership. Cancellation asks that waiter to kill
+the whole group and acknowledges cleanup only after it has waited for the
+leader and confirmed the group is gone. If cleanup cannot be confirmed, the
+sandbox retains a retry handle and returns
+`Error::ObservedCleanupPending`; it never treats killing the local Docker CLI
+as proof that the container workload stopped. Each execution first reserves a
+token-owned control directory; a startup fence lets a late supervisor observe
+an earlier cancellation without launching the requested command. The waiter
+keeps its done receipt until the sandbox has observed the acknowledgement, then
+releases it in a separate idempotent request. A per-execution sandbox view can
+retire its local failed-cleanup handle only after the owner confirms that the
+same container was destroyed. Confirmed destruction also invalidates any
+in-flight cleanup generation, so a late failure cannot retain a handle for the
+removed container. Images without `setsid` refuse observed execution before
+running the requested command.
+
 ### Snapshot identifiers
 
 `docker commit` prints `sha256:<64 hex>`, which is not a valid tinybox

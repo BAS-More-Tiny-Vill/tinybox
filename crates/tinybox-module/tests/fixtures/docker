@@ -1,0 +1,26 @@
+#!/bin/sh
+# Local Docker CLI fixture: no daemon or container isolation is claimed.
+operation=$1
+shift
+case "$operation" in
+  info) printf 'fixture-engine\n' ;;
+  ps) printf 'fixture-container\n' ;;
+  kill)
+    [ "$#" -eq 1 ] && [ "$1" = fixture-container ] || exit 1
+    ;;
+  run) printf 'fixture-container\n' ;;
+  exec)
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        -i) shift ;;
+        --workdir) cd "$2" || exit 1; shift 2 ;;
+        --env) export "$2" || exit 1; shift 2 ;;
+        *) shift; break ;;
+      esac
+    done
+    exec "$@"
+    ;;
+  inspect) printf 'running\n' ;;
+  rm) printf 'fixture-container\n' ;;
+  *) printf 'unsupported fixture operation\n' >&2; exit 1 ;;
+esac

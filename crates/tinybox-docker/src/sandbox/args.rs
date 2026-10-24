@@ -7,7 +7,7 @@
 //! testable without a daemon.
 
 use tinybox_core::{
-    BoxId, BoxSpec, Error, ExecRequest, NetworkPolicy, Resources, Result, SnapshotId,
+    BoxId, BoxSpec, Error, ExecRequest, NetworkPolicy, PortMapping, Resources, Result, SnapshotId,
     WorkspaceSource,
 };
 
@@ -16,6 +16,10 @@ use super::NAME;
 /// The label every tinybox container carries, so a stray container can be
 /// traced back to the tool that made it.
 pub const OWNER_LABEL: &str = "ai.tinyhumans.tinybox";
+
+/// A per-create token used to distinguish an in-flight create from a
+/// pre-existing container with the same deterministic name.
+pub(super) const OWNER_ATTEMPT_LABEL: &str = "ai.tinyhumans.tinybox.attempt";
 
 /// Where a bind-mounted local directory appears inside the container.
 pub const WORKSPACE_MOUNT: &str = "/workspace";
@@ -93,7 +97,12 @@ const KEEPALIVE: [&str; 3] = ["sh", "-c", "while :; do sleep 86400; done"];
 ///
 /// Returns [`Error::UnsupportedWorkspaceSource`] when the spec names a source
 /// this backend cannot turn into a container.
-pub(super) fn run(namespace: &str, id: &BoxId, spec: &BoxSpec) -> Result<Vec<String>> {
+pub(super) fn run(
+    namespace: &str,
+    id: &BoxId,
+    attempt: &str,
+    spec: &BoxSpec,
+) -> Result<Vec<String>> {
     let mut argv = vec![
         "docker".to_owned(),
         "run".to_owned(),
@@ -102,10 +111,12 @@ pub(super) fn run(namespace: &str, id: &BoxId, spec: &BoxSpec) -> Result<Vec<Str
         container_name(namespace, id),
         "--label".to_owned(),
         format!("{OWNER_LABEL}={id}"),
+        "--label".to_owned(),
+        format!("{OWNER_ATTEMPT_LABEL}={attempt}"),
     ];
 
     argv.extend(resource_flags(&spec.resources));
-    argv.extend(network_flags(spec.network));
+    argv.extend(network_flags(&spec.network));
     argv.extend(port_flags(spec));
 
     if let WorkspaceSource::LocalDir(path) = &spec.source {
@@ -150,7 +161,7 @@ fn resource_flags(resources: &Resources) -> Vec<String> {
 /// Docker has no "outbound only" network mode, so `Egress` gets the default
 /// bridge — outbound works, and nothing is published inbound because tinybox
 /// never passes `--publish`.
-fn network_flags(policy: NetworkPolicy) -> Vec<String> {
+fn network_flags(policy: &NetworkPolicy) -> Vec<String> {
     match policy {
         NetworkPolicy::Egress | NetworkPolicy::Open => Vec::new(),
         // `Denied`, and anything added to the non-exhaustive enum later. An
@@ -199,6 +210,16 @@ pub(super) fn exec(namespace: &str, id: &BoxId, request: &ExecRequest) -> Result
     }
 
     let mut argv = vec!["docker".to_owned(), "exec".to_owned()];
+    add_exec_context(&mut argv, request);
+    argv.push(container_name(namespace, id));
+    // `--` is not accepted here, so the container name is the last flag-like
+    // argument and everything after it belongs to the command.
+    argv.extend(request.argv.iter().cloned());
+    Ok(argv)
+}
+
+/// Add Docker exec working-directory and environment flags.
+pub(super) fn add_exec_context(argv: &mut Vec<String>, request: &ExecRequest) {
     if let Some(cwd) = &request.cwd {
         argv.push("--workdir".to_owned());
         argv.push(cwd.display().to_string());
@@ -207,11 +228,6 @@ pub(super) fn exec(namespace: &str, id: &BoxId, request: &ExecRequest) -> Result
         argv.push("--env".to_owned());
         argv.push(format!("{key}={value}"));
     }
-    argv.push(container_name(namespace, id));
-    // `--` is not accepted here, so the container name is the last flag-like
-    // argument and everything after it belongs to the command.
-    argv.extend(request.argv.iter().cloned());
-    Ok(argv)
 }
 
 /// The `docker inspect` command that reports one container's state.
@@ -221,6 +237,72 @@ pub(super) fn inspect(namespace: &str, id: &BoxId) -> Vec<String> {
         "inspect".to_owned(),
         "--format".to_owned(),
         "{{.State.Status}}".to_owned(),
+        container_name(namespace, id),
+    ]
+}
+
+/// The Docker-assigned host ports for one container.
+pub(super) fn published_ports(namespace: &str, id: &BoxId) -> Vec<String> {
+    vec![
+        "docker".to_owned(),
+        "inspect".to_owned(),
+        "--format".to_owned(),
+        "{{json .NetworkSettings.Ports}}".to_owned(),
+        container_name(namespace, id),
+    ]
+}
+
+/// Parse effective host ports from Docker's `NetworkSettings.Ports` JSON.
+///
+/// # Errors
+/// Returns a backend error if Docker returns malformed bindings or a port
+/// outside the TCP/UDP port range.
+pub(super) fn parse_published_ports(json: &str) -> Result<Vec<PortMapping>> {
+    let bindings: std::collections::BTreeMap<
+        String,
+        Option<Vec<std::collections::BTreeMap<String, String>>>,
+    > = serde_json::from_str(json).map_err(|error| Error::Backend {
+        sandbox: NAME.to_owned(),
+        operation: "parse published container ports",
+        message: error.to_string(),
+    })?;
+    let mut ports = std::collections::BTreeSet::new();
+    for (container_port, host_bindings) in bindings {
+        let guest = container_port
+            .split_once('/')
+            .and_then(|(port, _)| port.parse::<u16>().ok())
+            .ok_or_else(|| Error::Backend {
+                sandbox: NAME.to_owned(),
+                operation: "parse published container ports",
+                message: "Docker returned an invalid container port".to_owned(),
+            })?;
+        for binding in host_bindings.unwrap_or_default() {
+            let host = binding
+                .get("HostPort")
+                .and_then(|port| port.parse::<u16>().ok())
+                .ok_or_else(|| Error::Backend {
+                    sandbox: NAME.to_owned(),
+                    operation: "parse published container ports",
+                    message: "Docker returned an invalid host port".to_owned(),
+                })?;
+            ports.insert(PortMapping {
+                guest,
+                host: Some(host),
+            });
+        }
+    }
+    Ok(ports.into_iter().collect())
+}
+
+/// Read a container's per-create ownership token before reconciling an
+/// ambiguous `docker run` failure.
+pub(super) fn inspect_attempt(namespace: &str, id: &BoxId) -> Vec<String> {
+    vec![
+        "docker".to_owned(),
+        "container".to_owned(),
+        "inspect".to_owned(),
+        "--format".to_owned(),
+        format!("{{{{ index .Config.Labels \"{OWNER_ATTEMPT_LABEL}\" }}}}"),
         container_name(namespace, id),
     ]
 }

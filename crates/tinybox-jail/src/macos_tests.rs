@@ -29,6 +29,22 @@ fn profile_allow_subprocess_default_has_no_process_deny() {
 }
 
 #[test]
+fn profile_denies_reads_and_writes_of_denied_paths_last() {
+    let mut jail = Jail::new("/Users/a/project", "x");
+    assert!(!render_profile(&jail).contains("file-read*"));
+    jail.deny_read = vec!["/Users/a/.ssh".into(), "/Users/a/.netrc".into()];
+    let p = render_profile(&jail);
+    let denial = p
+        .find("(deny file-read* file-write*")
+        .expect("denied paths are emitted");
+    // After the write allows, so it overrides them.
+    assert!(denial > p.find("(allow file-write*").unwrap());
+    assert!(p[denial..].contains("(subpath \"/Users/a/.ssh\")"));
+    assert!(p[denial..].contains("(subpath \"/Users/a/.netrc\")"));
+    assert!(SeatbeltBackend::new().carves_denials());
+}
+
+#[test]
 fn escape_handles_backslash_and_quote() {
     assert_eq!(escape("a\\b"), "a\\\\b");
     assert_eq!(escape("a\"b"), "a\\\"b");
@@ -295,6 +311,25 @@ fn assert_default_name<B: JailBackend + Default>(name: &str) {
 fn launcher_does_not_restore_inherited_environment_after_env_clear() -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
+    const SENTINEL: &str = "TINYBOX_JAIL_TEST_INHERITED_SECRET";
+    if std::env::var_os(SENTINEL).is_none() {
+        // Set a parent-only sentinel in a subprocess; never mutate the shared
+        // environment of parallel test threads.
+        let output = Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "macos::tests::launcher_does_not_restore_inherited_environment_after_env_clear",
+                "--nocapture",
+            ])
+            .env(SENTINEL, "parent-only-secret")
+            .output()?;
+        assert!(
+            output.status.success(),
+            "isolated test failed: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        return Ok(());
+    }
     let root = tempfile::tempdir()?;
     let launcher = root.path().join("launcher");
     fs::write(&launcher, "#!/bin/sh\nshift 2\nexec \"$@\"\n")?;
@@ -308,13 +343,127 @@ fn launcher_does_not_restore_inherited_environment_after_env_clear() -> std::io:
     )
     .output()?;
     assert!(output.status.success());
-    // Some shells add PWD while executing a script. No inherited parent keys
-    // should survive, and the explicitly supplied value must still be there.
+    // The shell may synthesize PWD/SHLVL and other local variables. The
+    // boundary is the parent sentinel, not a whitelist of shell internals.
     let env = String::from_utf8_lossy(&output.stdout);
     assert!(env.lines().any(|line| line == "JAIL_EXPLICIT=allowed"));
     assert!(
-        env.lines()
-            .all(|line| line.starts_with("JAIL_EXPLICIT=") || line.starts_with("PWD="))
+        !env.lines()
+            .any(|line| line.starts_with(&format!("{SENTINEL}="))),
+        "the launcher restored the inherited parent sentinel"
     );
+    Ok(())
+}
+
+/// The launcher must lead its own process group, or a caller that times the
+/// jailed command out can only kill `sandbox-exec` while the shell pipeline it
+/// launched keeps running. Spawn a shell with a background grandchild, signal
+/// the launcher's group, and the grandchild must be gone.
+#[test]
+fn launcher_leads_a_process_group_so_a_group_kill_reaches_grandchildren() {
+    let backend = SeatbeltBackend::new();
+    if !backend.is_available() {
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("oh-pg-{}", std::process::id()));
+    fs::create_dir_all(&root).unwrap();
+    let mut jail = Jail::new(&root, "pg");
+    jail.canonicalize().unwrap();
+    let mut cmd = Command::new("/bin/sh");
+    cmd.arg("-c")
+        .arg("sleep 30 & echo $! > gc.pid; wait")
+        .current_dir(&root)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = backend.spawn(&jail, cmd).expect("spawn");
+
+    let pidfile = root.join("gc.pid");
+    let grandchild = loop {
+        if let Ok(text) = fs::read_to_string(&pidfile)
+            && let Ok(pid) = text.trim().parse::<u32>()
+        {
+            break pid;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    // Signal the launcher's group, as a timeout would.
+    let killed = Command::new("kill")
+        .args(["-KILL", &format!("-{}", child.id())])
+        .status()
+        .expect("kill runs");
+    assert!(
+        killed.success(),
+        "the launcher must lead a group that can be signalled"
+    );
+    let _ = child.wait();
+
+    let mut gone = false;
+    for _ in 0..100 {
+        let alive = Command::new("kill")
+            .args(["-0", &grandchild.to_string()])
+            .status()
+            .is_ok_and(|s| s.success());
+        if !alive {
+            gone = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    fs::remove_dir_all(&root).ok();
+    assert!(gone, "grandchild {grandchild} survived the group kill");
+}
+
+#[test]
+fn executable_presence_cannot_satisfy_hard_seatbelt_denials() {
+    use tinybox_core::{Constraint, ConstraintSupport, Enforcement};
+    assert_eq!(declared_constraint_support(false), ConstraintSupport::NONE);
+    // No process-isolation guarantee can follow from a launcher-presence check,
+    // even on macOS where the launcher exists.
+    assert_eq!(
+        SeatbeltBackend::new().isolation(),
+        tinybox_core::IsolationLevel::None
+    );
+    let present = declared_constraint_support(true);
+    for constraint in [
+        Constraint::Filesystem,
+        Constraint::Network,
+        Constraint::Subprocess,
+    ] {
+        assert_eq!(present.enforcement(constraint), Enforcement::BestEffort);
+        assert!(matches!(
+            present.require("seatbelt", &[constraint]),
+            Err(tinybox_core::Error::ConstraintNotEnforced {
+                enforcement: Enforcement::BestEffort,
+                ..
+            })
+        ));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn captured_launcher_preserves_all_three_owned_pipes() -> std::io::Result<()> {
+    use std::io::Write;
+    let root = tempfile::tempdir()?;
+    // A stable fixture avoids ETXTBSY when parallel fork/exec temporarily
+    // inherits a just-created executable's writable descriptor.
+    let launcher = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/captured-launcher.sh");
+    let jail = Jail::new(root.path(), "captured-fixture");
+    let mut command = Command::new("/bin/sh");
+    command
+        .args(["-c", "cat; printf diagnostic >&2"])
+        .env_clear();
+    let mut child = prepare_captured_command(&jail, &command, launcher.as_os_str()).spawn()?;
+    let mut input = child
+        .stdin
+        .take()
+        .ok_or_else(|| std::io::Error::other("missing stdin"))?;
+    input.write_all(b"owned-input")?;
+    drop(input);
+    let output = child.wait_with_output()?;
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"owned-input");
+    assert_eq!(output.stderr, b"diagnostic");
     Ok(())
 }

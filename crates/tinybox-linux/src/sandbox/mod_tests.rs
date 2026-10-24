@@ -44,7 +44,34 @@ impl Host for RecordingHost {
 
     async fn run(&self, request: &ExecRequest) -> Result<ExecOutput> {
         self.seen().push(request.argv.clone());
+        if request.argv == ["systemd-run", "--help"] {
+            return Ok(ExecOutput::new(
+                0,
+                b"--expand-environment=BOOL".to_vec(),
+                Vec::new(),
+            ));
+        }
         Ok(ExecOutput::new(0, b"ran".to_vec(), Vec::new()))
+    }
+}
+
+#[derive(Debug, Default)]
+struct FailedProbeHost {
+    seen: Mutex<Vec<Vec<String>>>,
+}
+
+#[async_trait]
+impl Host for FailedProbeHost {
+    fn name(&self) -> &'static str {
+        "failed-probe"
+    }
+
+    async fn run(&self, request: &ExecRequest) -> Result<ExecOutput> {
+        self.seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(request.argv.clone());
+        Ok(ExecOutput::new(1, Vec::new(), b"probe failed".to_vec()))
     }
 }
 
@@ -94,15 +121,15 @@ fn it_declares_kernel_isolation_and_nothing_it_cannot_do() {
     assert!(!caps.supports(Capability::PauseResume));
     // Limits need a systemd user session, so they are not claimed by default.
     assert!(!caps.supports(Capability::ResourceLimits));
-    assert_eq!(caps.declared(), [] as [tinybox_core::Capability; 0]);
+    assert_eq!(caps.declared().len(), 0);
 }
 
 #[test]
-fn limits_are_declared_only_when_asked_for() {
+fn coarse_limits_are_declined_because_disk_is_not_enforced() {
     let caps = NamespaceSandbox::declared_capabilities(true);
 
-    assert!(caps.supports(Capability::ResourceLimits));
-    assert_eq!(caps.declared(), [Capability::ResourceLimits]);
+    assert!(!caps.supports(Capability::ResourceLimits));
+    assert_eq!(caps.declared(), Vec::<Capability>::new());
 }
 
 #[tokio::test]
@@ -300,6 +327,7 @@ async fn limits_wrap_the_sandbox_in_a_systemd_scope() -> Result<()> {
     assert_eq!(argv.first().map(String::as_str), Some("systemd-run"));
     assert!(has(&argv, "--user"));
     assert!(has(&argv, "--scope"));
+    assert!(has(&argv, "--expand-environment=no"));
     let properties = argv
         .iter()
         .enumerate()
@@ -321,6 +349,71 @@ async fn limits_wrap_the_sandbox_in_a_systemd_scope() -> Result<()> {
     );
     // The sandbox still runs inside the scope.
     assert!(has(&argv, "bwrap"));
+    Ok(())
+}
+
+#[test]
+fn systemd_scope_environment_flag_is_added_only_when_supported() {
+    let resources = Resources {
+        cpu_millis: 1_000,
+        memory_bytes: 64 * 1024 * 1024,
+        pids_max: 16,
+        disk_bytes: 1024 * 1024,
+    };
+
+    let supported = args::cgroup_prefix(&resources, true);
+    assert!(has(&supported, "--expand-environment=no"));
+    assert_eq!(
+        supported.get(3).map(String::as_str),
+        Some("--expand-environment=no")
+    );
+
+    let legacy = args::cgroup_prefix(&resources, false);
+    assert!(!has(&legacy, "--expand-environment=no"));
+    assert_eq!(legacy.get(3).map(String::as_str), Some("--quiet"));
+}
+
+#[test]
+fn systemd_environment_flag_probe_distinguishes_legacy_and_fails_closed() {
+    assert_eq!(
+        args::parse_expand_environment_help(true, b"--help", b""),
+        Ok(false)
+    );
+    assert_eq!(
+        args::parse_expand_environment_help(true, b"--expand-environment=BOOL", b""),
+        Ok(true)
+    );
+    assert_eq!(
+        args::parse_expand_environment_help(false, b"--expand-environment=BOOL", b""),
+        Err(Error::Unsupported {
+            sandbox: NAME.to_owned(),
+            capability: tinybox_core::Capability::ResourceLimits,
+        })
+    );
+}
+
+#[tokio::test]
+async fn failed_systemd_option_probe_refuses_without_launching_workload() -> Result<()> {
+    let host = Arc::new(FailedProbeHost::default());
+    let sandbox =
+        NamespaceSandbox::new(host.clone(), Arc::new(MemoryStore::new())).with_cgroup_limits();
+    let info = sandbox.create(&spec()?).await?;
+
+    let result = sandbox
+        .exec(&info.id, &ExecRequest::new(["echo", "must not run"]))
+        .await;
+
+    assert_eq!(
+        result,
+        Err(Error::Unsupported {
+            sandbox: NAME.to_owned(),
+            capability: Capability::ResourceLimits,
+        })
+    );
+    assert_eq!(
+        *host.seen.lock().unwrap_or_else(PoisonError::into_inner),
+        [vec!["systemd-run".to_owned(), "--help".to_owned()]]
+    );
     Ok(())
 }
 
@@ -490,5 +583,73 @@ fn the_workspace_mount_point_is_stable() -> Result<()> {
         args::workspace_dir(&spec()?)?,
         std::path::Path::new("/srv/work")
     );
+    Ok(())
+}
+
+#[test]
+fn preflight_reports_each_enforced_boundary_without_claiming_disk() {
+    use tinybox_core::{Constraint, Enforcement};
+    let (backend, _) = sandbox();
+    let support = backend.constraint_support();
+    assert_eq!(
+        support.enforcement(Constraint::Filesystem),
+        Enforcement::Enforced
+    );
+    assert_eq!(
+        support.enforcement(Constraint::Network),
+        Enforcement::Enforced
+    );
+    assert_eq!(
+        support.enforcement(Constraint::Cpu),
+        Enforcement::Unsupported
+    );
+    assert_eq!(
+        support.enforcement(Constraint::Memory),
+        Enforcement::Unsupported
+    );
+    assert_eq!(
+        support.enforcement(Constraint::Pids),
+        Enforcement::Unsupported
+    );
+    assert_eq!(
+        support.enforcement(Constraint::Disk),
+        Enforcement::Unsupported
+    );
+    assert_eq!(
+        support.enforcement(Constraint::Subprocess),
+        Enforcement::Unsupported
+    );
+    assert!(
+        backend
+            .require(&[Constraint::Filesystem, Constraint::Network])
+            .is_ok()
+    );
+    assert!(backend.require(&[Constraint::Disk]).is_err());
+    let constrained = backend.with_cgroup_limits().constraint_support();
+    for constraint in [Constraint::Cpu, Constraint::Memory, Constraint::Pids] {
+        assert_eq!(constrained.enforcement(constraint), Enforcement::Enforced);
+    }
+    assert_eq!(
+        constrained.enforcement(Constraint::Disk),
+        Enforcement::Unsupported
+    );
+}
+
+#[tokio::test]
+async fn an_unenforceable_network_allowlist_is_refused_at_creation() -> Result<()> {
+    let (sandbox, _host) = sandbox();
+    let policy = tinybox_core::NetworkPolicy::Allowlist(tinybox_core::EgressAllowlist::new(
+        ["example.com"],
+        [443],
+    ));
+    let result = sandbox.create(&spec()?.with_network(policy)).await;
+    assert!(matches!(
+        result,
+        Err(Error::ConstraintNotEnforced {
+            constraint: tinybox_core::Constraint::Network,
+            enforcement: tinybox_core::Enforcement::Unsupported,
+            ..
+        })
+    ));
     Ok(())
 }

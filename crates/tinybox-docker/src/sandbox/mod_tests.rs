@@ -9,7 +9,10 @@
 //! Behavior that genuinely needs a daemon lives in `tests/live_docker.rs`.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{
+    Arc, Mutex, MutexGuard, PoisonError,
+    atomic::{AtomicBool, Ordering},
+};
 
 use async_trait::async_trait;
 use tinybox_core::{
@@ -18,7 +21,31 @@ use tinybox_core::{
     SandboxRef, SnapshotId, SnapshotSupport, Store, WorkspaceSource,
 };
 
-use super::{DockerSandbox, NAME, args, state};
+use super::{DockerSandbox, NAME, args, cleanup_timeout_error, state};
+
+#[test]
+fn effective_published_ports_parse_dynamic_and_fixed_bindings() -> Result<()> {
+    let ports = args::parse_published_ports(
+        r#"{"8080/tcp":[{"HostIp":"0.0.0.0","HostPort":"32768"}],"8443/tcp":[{"HostIp":"127.0.0.1","HostPort":"8443"}],"53/udp":null}"#,
+    )?;
+
+    assert_eq!(
+        ports,
+        [
+            PortMapping {
+                guest: 8080,
+                host: Some(32768)
+            },
+            PortMapping {
+                guest: 8443,
+                host: Some(8443)
+            }
+        ]
+    );
+    assert!(args::parse_published_ports(r#"{"bad/tcp":[]}"#).is_err());
+    assert!(args::parse_published_ports(r#"{"8080/tcp":[{"HostPort":"not-a-port"}]}"#).is_err());
+    Ok(())
+}
 
 /// A digest `docker commit` might print.
 const COMMIT_OUTPUT: &str =
@@ -29,6 +56,15 @@ const COMMIT_OUTPUT: &str =
 struct ScriptedHost {
     replies: Mutex<VecDeque<ExecOutput>>,
     seen: Mutex<Vec<Vec<String>>>,
+    cancel_observed: AtomicBool,
+    refuse_observed: AtomicBool,
+    block_observed: AtomicBool,
+    fail_next_reservation: AtomicBool,
+    fail_next_abort: AtomicBool,
+    fail_next_receipt_release: AtomicBool,
+    fail_observed_cleanup: AtomicBool,
+    observed_started: tokio::sync::Notify,
+    release_observed: tokio::sync::Notify,
 }
 
 impl ScriptedHost {
@@ -79,10 +115,115 @@ impl Host for ScriptedHost {
 
     async fn run(&self, request: &ExecRequest) -> Result<ExecOutput> {
         self.seen().push(request.argv.clone());
+        if request
+            .argv
+            .iter()
+            .any(|argument| argument == "tinybox-observed-reserve")
+        {
+            if self.fail_next_reservation.swap(false, Ordering::AcqRel) {
+                return Ok(ExecOutput::new(
+                    125,
+                    Vec::new(),
+                    b"reservation refused".to_vec(),
+                ));
+            }
+            return Ok(ExecOutput::new(0, b"ready\n".to_vec(), Vec::new()));
+        }
+        if request
+            .argv
+            .iter()
+            .any(|argument| argument == "tinybox-observed-abort")
+            && self.fail_next_abort.swap(false, Ordering::AcqRel)
+        {
+            return Ok(ExecOutput::new(1, Vec::new(), b"abort refused".to_vec()));
+        }
+        if request
+            .argv
+            .iter()
+            .any(|argument| argument == "tinybox-observed-release")
+            && self.fail_next_receipt_release.swap(false, Ordering::AcqRel)
+        {
+            return Ok(ExecOutput::new(
+                1,
+                Vec::new(),
+                b"release reply lost".to_vec(),
+            ));
+        }
+        if request
+            .argv
+            .iter()
+            .any(|argument| argument == "tinybox-observed-cancel")
+            && self.fail_observed_cleanup.load(Ordering::Acquire)
+        {
+            return Ok(ExecOutput::new(
+                1,
+                Vec::new(),
+                b"container removed during observed cleanup".to_vec(),
+            ));
+        }
+        let attempt_owner = if request
+            .argv
+            .iter()
+            .any(|argument| argument.contains(args::OWNER_ATTEMPT_LABEL))
+        {
+            self.seen()
+                .iter()
+                .rev()
+                .find_map(|command| {
+                    command.windows(2).find_map(|pair| {
+                        pair[0]
+                            .eq("--label")
+                            .then_some(pair[1].as_str())
+                            .filter(|label| {
+                                label.starts_with(&format!("{}=", args::OWNER_ATTEMPT_LABEL))
+                            })
+                    })
+                })
+                .and_then(|label| label.split_once('=').map(|(_, value)| value.to_owned()))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
         Ok(self
             .replies()
             .pop_front()
-            .unwrap_or_else(|| ExecOutput::new(0, Vec::new(), Vec::new())))
+            .unwrap_or_else(|| ExecOutput::new(0, attempt_owner.into_bytes(), Vec::new())))
+    }
+
+    async fn run_observed(
+        &self,
+        request: &ExecRequest,
+        observer: Arc<dyn tinybox_core::ExecutionObserver>,
+    ) -> Result<ExecOutput> {
+        self.seen().push(request.argv.clone());
+        if self.refuse_observed.load(Ordering::Acquire) {
+            return Err(Error::UnsupportedStreaming {
+                provider: self.name().to_owned(),
+            });
+        }
+        if self.block_observed.load(Ordering::Acquire) {
+            self.observed_started.notify_one();
+            self.release_observed.notified().await;
+        }
+        if self.cancel_observed.load(Ordering::Acquire) {
+            observer.cancelled().await;
+            return Err(Error::Backend {
+                sandbox: NAME.to_owned(),
+                operation: "collect observed output",
+                message: "execution cancelled".to_owned(),
+            });
+        }
+        let output = self
+            .replies()
+            .pop_front()
+            .unwrap_or_else(|| ExecOutput::new(0, Vec::new(), Vec::new()));
+        if !output.stdout.is_empty() {
+            observer.output(tinybox_core::OutputStream::Stdout, &output.stdout)?;
+        }
+        if !output.stderr.is_empty() {
+            observer.output(tinybox_core::OutputStream::Stderr, &output.stderr)?;
+        }
+        Ok(output)
     }
 }
 
@@ -112,6 +253,38 @@ fn flag_value<'a>(argv: &'a [String], flag: &str) -> Option<&'a str> {
         .map(String::as_str)
 }
 
+#[derive(Debug, Default)]
+struct CapturingObserver {
+    cancel: bool,
+    batches: Mutex<Vec<(tinybox_core::OutputStream, Vec<u8>)>>,
+}
+
+impl CapturingObserver {
+    fn batches(&self) -> Vec<(tinybox_core::OutputStream, Vec<u8>)> {
+        self.batches
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+#[async_trait]
+impl tinybox_core::ExecutionObserver for CapturingObserver {
+    fn output(&self, stream: tinybox_core::OutputStream, bytes: &[u8]) -> Result<()> {
+        self.batches
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((stream, bytes.to_vec()));
+        Ok(())
+    }
+
+    async fn cancelled(&self) {
+        if !self.cancel {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
 #[test]
 fn it_declares_kernel_isolation_and_filesystem_snapshots() {
     let caps = DockerSandbox::declared_capabilities();
@@ -121,7 +294,7 @@ fn it_declares_kernel_isolation_and_filesystem_snapshots() {
     // The first backend that is a defensible place for untrusted code.
     assert!(caps.is_suitable_for_untrusted_code());
     assert!(caps.supports(Capability::Fork));
-    assert!(caps.supports(Capability::ResourceLimits));
+    assert!(!caps.supports(Capability::ResourceLimits));
     // `docker pause` exists, but no trait method reaches it, so it is not
     // claimed.
     assert!(!caps.supports(Capability::PauseResume));
@@ -314,7 +487,7 @@ async fn a_git_source_is_refused_before_anything_runs() -> Result<()> {
             kind: "git repository",
         })
     );
-    assert!(host.commands().is_empty(), "nothing should have been run");
+    assert_eq!(host.commands().len(), 0, "nothing should have been run");
     Ok(())
 }
 
@@ -336,7 +509,106 @@ async fn a_docker_failure_carries_dockers_own_diagnostic() -> Result<()> {
         })
     );
     // A container that was never created must leave no record.
-    assert_eq!(store.list()?, Vec::<tinybox_core::BoxInfo>::new());
+    assert_eq!(store.list()?.len(), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_name_conflict_never_removes_the_existing_container() -> Result<()> {
+    let host = ScriptedHost::silent();
+    let first_store = Arc::new(MemoryStore::new());
+    let second_store = Arc::new(MemoryStore::new());
+    let first = DockerSandbox::new(host.clone(), first_store.clone());
+    let second = DockerSandbox::new(host.clone(), second_store.clone());
+    first.create(&spec()?).await?;
+    host.push_failure("Conflict. The container name \"/tinybox-default-box-0\" is already in use");
+
+    let outcome = second.create(&spec()?).await;
+
+    assert!(outcome.is_err());
+    let commands = host.commands();
+    assert_eq!(commands.len(), 2, "a name conflict must not run rm");
+    assert!(commands.iter().all(|command| command[1] == "run"));
+    assert_eq!(first_store.list()?.len(), 1);
+    assert_eq!(second_store.list()?.len(), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_lost_create_reply_removes_only_our_verified_create_attempt() -> Result<()> {
+    let (sandbox, host, store) = sandbox();
+    host.push_failure("connection reset after create");
+
+    assert!(sandbox.create(&spec()?).await.is_err());
+
+    let commands = host.commands();
+    assert_eq!(commands.len(), 3);
+    assert_eq!(commands[1][1], "container");
+    assert_eq!(commands[1][2], "inspect");
+    assert!(commands[1][4].contains(args::OWNER_ATTEMPT_LABEL));
+    assert_eq!(commands[2][1], "rm");
+    assert_eq!(store.list()?.len(), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_create_ownership_probe_uses_container_specific_inspection() -> Result<()> {
+    let store = Arc::new(MemoryStore::new());
+    let sandbox = DockerSandbox::new(Arc::new(MissingContainerHost), store.clone());
+    assert!(sandbox.create(&spec()?).await.is_err());
+    assert_eq!(store.list()?.len(), 0);
+    Ok(())
+}
+
+/// Model the Docker CLI's different missing-object diagnostics, without a daemon.
+#[derive(Debug)]
+struct MissingContainerHost;
+
+#[async_trait]
+impl Host for MissingContainerHost {
+    fn name(&self) -> &'static str {
+        "scripted"
+    }
+
+    async fn run(&self, request: &ExecRequest) -> Result<ExecOutput> {
+        let error = match request.argv.get(1).map(String::as_str) {
+            Some("run") => "image download failed",
+            Some("container") => "Error: No such container: tinybox-default-box-0",
+            _ => "Error: No such object: tinybox-default-box-0",
+        };
+        Ok(ExecOutput::new(1, Vec::new(), error.as_bytes().to_vec()))
+    }
+}
+
+#[tokio::test]
+async fn a_lost_create_reply_leaves_a_foreign_container_untouched() -> Result<()> {
+    let (sandbox, host, store) = sandbox();
+    host.push_failure("connection reset after create");
+    host.push_ok("different-owner");
+
+    assert!(sandbox.create(&spec()?).await.is_err());
+
+    let commands = host.commands();
+    assert_eq!(commands.len(), 2);
+    assert_eq!(commands[1][1], "container");
+    assert_eq!(commands[1][2], "inspect");
+    assert_eq!(store.list()?.len(), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_same_id_container_from_another_attempt_is_not_removed() -> Result<()> {
+    let (sandbox, host, store) = sandbox();
+    host.push_failure("connection reset after create");
+    host.push_ok("box-0"); // matching box id, but not the per-attempt token
+
+    assert!(sandbox.create(&spec()?).await.is_err());
+
+    let commands = host.commands();
+    assert_eq!(commands.len(), 2);
+    assert_eq!(commands[1][1], "container");
+    assert_eq!(commands[1][2], "inspect");
+    assert_eq!(store.list()?.len(), 0);
     Ok(())
 }
 
@@ -402,6 +674,445 @@ async fn a_command_carries_its_working_directory_and_environment() -> Result<()>
 }
 
 #[tokio::test]
+async fn observed_command_forwards_live_bytes_and_waits_for_remote_ack() -> Result<()> {
+    let (sandbox, host, _store) = sandbox();
+    let info = sandbox.create(&spec()?).await?;
+    host.push_ok("running");
+    host.push(ExecOutput::new(9, vec![0, 255], b"failure".to_vec()));
+    host.push_ok(""); // Remote waiter acknowledgement and control-dir cleanup.
+    let observer = Arc::new(CapturingObserver::default());
+
+    let output = sandbox
+        .exec_observed(
+            &info.id,
+            &ExecRequest::new(["binary-command"]),
+            observer.clone(),
+        )
+        .await?;
+
+    assert_eq!(output.exit_code, 9);
+    assert_eq!(output.stdout, [0, 255]);
+    assert_eq!(output.stderr, b"failure");
+    assert_eq!(
+        observer.batches(),
+        [
+            (tinybox_core::OutputStream::Stdout, vec![0, 255]),
+            (tinybox_core::OutputStream::Stderr, b"failure".to_vec()),
+        ]
+    );
+    assert!(!sandbox.has_pending_observed_cleanup());
+    let observed_command = host.command(3).unwrap_or_default();
+    assert_eq!(observed_command[0..3], ["docker", "exec", "-i"]);
+    assert!(observed_command.iter().any(|arg| arg == "binary-command"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_remote_ack_is_retained_and_retried_without_waiting_for_runs() -> Result<()> {
+    let (sandbox, host, _store) = sandbox();
+    let info = sandbox.create(&spec()?).await?;
+    host.push_ok("running");
+    host.push_failure("container waiter did not acknowledge");
+    host.cancel_observed.store(true, Ordering::Release);
+    let observer = Arc::new(CapturingObserver {
+        cancel: true,
+        ..CapturingObserver::default()
+    });
+
+    let result = sandbox
+        .exec_observed(&info.id, &ExecRequest::new(["long-running"]), observer)
+        .await;
+
+    assert_eq!(
+        result.err(),
+        Some(Error::ObservedCleanupPending {
+            provider: NAME.to_owned(),
+        })
+    );
+    assert!(sandbox.has_pending_observed_cleanup());
+
+    host.push_ok("");
+    sandbox.retry_observed_cleanup().await?;
+
+    assert!(!sandbox.has_pending_observed_cleanup());
+    Ok(())
+}
+
+#[tokio::test]
+async fn unstarted_reservation_cleanup_is_retained_and_retried() -> Result<()> {
+    let (sandbox, host, _store) = sandbox();
+    let info = sandbox.create(&spec()?).await?;
+    host.push_ok("running");
+    host.fail_next_reservation.store(true, Ordering::Release);
+    host.fail_next_abort.store(true, Ordering::Release);
+
+    let result = sandbox
+        .exec_observed(
+            &info.id,
+            &ExecRequest::new(["not-dispatched"]),
+            Arc::new(CapturingObserver::default()),
+        )
+        .await;
+
+    assert_eq!(
+        result.err(),
+        Some(Error::ObservedCleanupPending {
+            provider: NAME.to_owned(),
+        })
+    );
+    assert!(sandbox.has_pending_observed_cleanup());
+    assert!(
+        !host
+            .commands()
+            .iter()
+            .any(|command| command.iter().any(|argument| argument == "not-dispatched"))
+    );
+
+    sandbox.retry_observed_cleanup().await?;
+    assert!(!sandbox.has_pending_observed_cleanup());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_lost_receipt_release_reply_retries_without_reacknowledging_cleanup() -> Result<()> {
+    let (sandbox, host, _store) = sandbox();
+    let info = sandbox.create(&spec()?).await?;
+    host.push_ok("running");
+    host.fail_next_receipt_release
+        .store(true, Ordering::Release);
+    host.cancel_observed.store(true, Ordering::Release);
+
+    let result = sandbox
+        .exec_observed(
+            &info.id,
+            &ExecRequest::new(["long-running"]),
+            Arc::new(CapturingObserver {
+                cancel: true,
+                ..CapturingObserver::default()
+            }),
+        )
+        .await;
+
+    assert_eq!(
+        result.err(),
+        Some(Error::ObservedCleanupPending {
+            provider: NAME.to_owned(),
+        })
+    );
+    let commands_before_retry = host.commands();
+    assert_eq!(
+        commands_before_retry
+            .iter()
+            .filter(|command| command
+                .iter()
+                .any(|argument| argument == "tinybox-observed-cancel"))
+            .count(),
+        1
+    );
+
+    sandbox.retry_observed_cleanup().await?;
+    assert!(!sandbox.has_pending_observed_cleanup());
+    let commands_after_retry = host.commands();
+    assert_eq!(
+        commands_after_retry
+            .iter()
+            .filter(|command| command
+                .iter()
+                .any(|argument| argument == "tinybox-observed-cancel"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        commands_after_retry
+            .iter()
+            .filter(|command| command
+                .iter()
+                .any(|argument| argument == "tinybox-observed-release"))
+            .count(),
+        2
+    );
+    Ok(())
+}
+
+#[test]
+fn observed_cleanup_timeout_has_a_typed_diagnostic() {
+    assert_eq!(
+        cleanup_timeout_error(),
+        Error::Backend {
+            sandbox: NAME.to_owned(),
+            operation: "acknowledge observed execution cleanup",
+            message: "container-side waiter did not acknowledge cleanup before the deadline"
+                .to_owned(),
+        }
+    );
+}
+
+#[tokio::test]
+async fn a_failed_remote_ack_reply_is_retained_until_retry_succeeds() -> Result<()> {
+    let (sandbox, host, _store) = sandbox();
+    let info = sandbox.create(&spec()?).await?;
+    host.push_ok("running");
+    host.push(ExecOutput::new(
+        1,
+        Vec::new(),
+        b"waiter did not finish cleanup".to_vec(),
+    ));
+    host.cancel_observed.store(true, Ordering::Release);
+
+    let result = sandbox
+        .exec_observed(
+            &info.id,
+            &ExecRequest::new(["long-running"]),
+            Arc::new(CapturingObserver {
+                cancel: true,
+                ..CapturingObserver::default()
+            }),
+        )
+        .await;
+
+    assert_eq!(
+        result.err(),
+        Some(Error::ObservedCleanupPending {
+            provider: NAME.to_owned(),
+        })
+    );
+    assert!(sandbox.has_pending_observed_cleanup());
+    host.push_ok("");
+    sandbox.retry_observed_cleanup().await?;
+    assert!(!sandbox.has_pending_observed_cleanup());
+    Ok(())
+}
+
+#[tokio::test]
+async fn destroying_a_container_retires_its_failed_observed_cleanup() -> Result<()> {
+    let (sandbox, host, _store) = sandbox();
+    let info = sandbox.create(&spec()?).await?;
+    host.push_ok("running");
+    host.push_failure("container waiter did not acknowledge");
+    host.cancel_observed.store(true, Ordering::Release);
+    let result = sandbox
+        .exec_observed(
+            &info.id,
+            &ExecRequest::new(["long-running"]),
+            Arc::new(CapturingObserver {
+                cancel: true,
+                ..CapturingObserver::default()
+            }),
+        )
+        .await;
+    assert_eq!(
+        result.err(),
+        Some(Error::ObservedCleanupPending {
+            provider: NAME.to_owned(),
+        })
+    );
+    assert!(sandbox.has_pending_observed_cleanup());
+
+    host.push_ok("");
+    sandbox.destroy(&info.id).await?;
+
+    assert!(!sandbox.has_pending_observed_cleanup());
+    Ok(())
+}
+
+#[tokio::test]
+async fn unavailable_host_observation_does_not_fall_back_to_collected_exec() -> Result<()> {
+    let (sandbox, host, _store) = sandbox();
+    let info = sandbox.create(&spec()?).await?;
+    host.push_ok("running");
+    host.refuse_observed.store(true, Ordering::Release);
+    let calls_before = host.commands().len();
+
+    let error = sandbox
+        .exec_observed(
+            &info.id,
+            &ExecRequest::new(["must-not-run-collected"]),
+            Arc::new(CapturingObserver::default()),
+        )
+        .await
+        .err();
+
+    assert_eq!(
+        error,
+        Some(Error::UnsupportedStreaming {
+            provider: "scripted".to_owned(),
+        })
+    );
+    assert_eq!(host.commands().len(), calls_before + 5); // Inspect, reservation, refused call, retry reservation, release.
+    assert!(!sandbox.has_pending_observed_cleanup());
+    Ok(())
+}
+
+#[tokio::test]
+async fn image_without_process_group_support_fails_closed() -> Result<()> {
+    let (sandbox, host, _store) = sandbox();
+    let info = sandbox.create(&spec()?).await?;
+    host.push_ok("running");
+    host.push(ExecOutput::new(125, Vec::new(), Vec::new()));
+    host.push_ok("unsupported");
+
+    let result = sandbox
+        .exec_observed(
+            &info.id,
+            &ExecRequest::new(["must-not-run"]),
+            Arc::new(CapturingObserver::default()),
+        )
+        .await;
+
+    assert_eq!(
+        result.err(),
+        Some(Error::UnsupportedStreaming {
+            provider: NAME.to_owned(),
+        })
+    );
+    assert!(!sandbox.has_pending_observed_cleanup());
+    Ok(())
+}
+
+#[tokio::test]
+async fn active_observed_execution_is_not_reported_as_pending_cleanup() -> Result<()> {
+    let (sandbox, host, _store) = sandbox();
+    let info = sandbox.create(&spec()?).await?;
+    host.push_ok("running");
+    host.push_ok(""); // Remote waiter acknowledgement after the command returns.
+    host.block_observed.store(true, Ordering::Release);
+    let sandbox = Arc::new(sandbox);
+    let running = {
+        let sandbox = sandbox.clone();
+        let id = info.id.clone();
+        tokio::spawn(async move {
+            sandbox
+                .exec_observed(
+                    &id,
+                    &ExecRequest::new(["still-running"]),
+                    Arc::new(CapturingObserver::default()),
+                )
+                .await
+        })
+    };
+
+    host.observed_started.notified().await;
+    assert!(!sandbox.has_pending_observed_cleanup());
+    host.release_observed.notify_one();
+    running.await.map_err(|error| Error::Backend {
+        sandbox: NAME.to_owned(),
+        operation: "join observed fixture",
+        message: error.to_string(),
+    })??;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn observed_host_view_reuses_container_identity_and_isolates_cleanup_state() -> Result<()> {
+    let host = ScriptedHost::silent();
+    let store = Arc::new(MemoryStore::new());
+    let sandbox = DockerSandbox::with_namespace(host.clone(), store, "team")?;
+    let info = sandbox.create(&spec()?).await?;
+    let execution_host = ScriptedHost::silent();
+    execution_host.push_ok("running"); // Inspect the existing container on this host.
+    execution_host.push_failure("container waiter did not acknowledge");
+    execution_host
+        .cancel_observed
+        .store(true, Ordering::Release);
+    let execution_sandbox = sandbox.for_observed_host(execution_host.clone());
+
+    let result = execution_sandbox
+        .exec_observed(
+            &info.id,
+            &ExecRequest::new(["long-running"]),
+            Arc::new(CapturingObserver {
+                cancel: true,
+                ..CapturingObserver::default()
+            }),
+        )
+        .await;
+
+    assert_eq!(
+        result.err(),
+        Some(Error::ObservedCleanupPending {
+            provider: NAME.to_owned(),
+        })
+    );
+    assert!(execution_sandbox.has_pending_observed_cleanup());
+    assert!(!sandbox.has_pending_observed_cleanup());
+    let observed_argv = execution_host.command(2).unwrap_or_default();
+    assert_eq!(observed_argv[0..3], ["docker", "exec", "-i"]);
+    assert!(observed_argv.iter().any(|arg| arg == "tinybox-team-box-0"));
+
+    let original_calls = host.commands().len();
+    sandbox.retry_observed_cleanup().await?;
+    assert_eq!(host.commands().len(), original_calls);
+
+    let execution_calls = execution_host.commands().len();
+    sandbox.destroy(&info.id).await?;
+    assert!(execution_sandbox.has_pending_observed_cleanup());
+    execution_sandbox.acknowledge_observed_cleanup_for_destroyed_box(&info.id);
+    assert!(!execution_sandbox.has_pending_observed_cleanup());
+    assert_eq!(execution_host.commands().len(), execution_calls);
+    Ok(())
+}
+
+#[tokio::test]
+async fn confirmed_destroy_prevents_a_late_observed_cleanup_handle_from_being_retained()
+-> Result<()> {
+    let (sandbox, host, store) = sandbox();
+    let info = sandbox.create(&spec()?).await?;
+    let observed_view = sandbox.for_observed_host(host.clone());
+    host.push_ok("running");
+    host.block_observed.store(true, Ordering::Release);
+    host.fail_observed_cleanup.store(true, Ordering::Release);
+
+    let execution_view = observed_view.clone();
+    let id = info.id.clone();
+    let execution = tokio::spawn(async move {
+        execution_view
+            .exec_observed(
+                &id,
+                &ExecRequest::new(["long-running-command"]),
+                Arc::new(CapturingObserver {
+                    cancel: true,
+                    ..CapturingObserver::default()
+                }),
+            )
+            .await
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        host.observed_started.notified(),
+    )
+    .await
+    .map_err(|_| Error::Backend {
+        sandbox: NAME.to_owned(),
+        operation: "start concurrent observed-destroy fixture",
+        message: "observed execution did not reach the host".to_owned(),
+    })?;
+
+    // Destruction confirms that Docker removed the complete container while
+    // the per-execution host view is still waiting for its observed reply.
+    sandbox.destroy(&info.id).await?;
+    assert_eq!(store.list()?.len(), 0);
+    host.cancel_observed.store(true, Ordering::Release);
+    host.release_observed.notify_one();
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(3), execution)
+        .await
+        .map_err(|_| Error::Backend {
+            sandbox: NAME.to_owned(),
+            operation: "finish concurrent observed-destroy fixture",
+            message: "observed execution did not finish after the host reply".to_owned(),
+        })?
+        .map_err(|error| Error::Backend {
+            sandbox: NAME.to_owned(),
+            operation: "join concurrent observed-destroy fixture",
+            message: error.to_string(),
+        })?;
+    assert!(result.is_err());
+    assert!(!observed_view.has_pending_observed_cleanup());
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_command_with_no_program_is_refused() -> Result<()> {
     let (sandbox, host, _store) = sandbox();
     let info = sandbox.create(&spec()?).await?;
@@ -434,6 +1145,69 @@ async fn a_stopped_container_accepts_no_commands() -> Result<()> {
             expected: BoxState::Ready,
         })
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_nonzero_detached_stop_is_reported_as_unfinished_cleanup() -> Result<()> {
+    let (sandbox, host, _store) = sandbox();
+    let info = sandbox.create(&spec()?).await?;
+    let process = tinybox_core::ProcessId::new("process-1")?;
+    host.push_ok("running");
+    host.push_failure("process cleanup was refused");
+
+    assert_eq!(
+        sandbox.stop(&info.id, &process).await.err(),
+        Some(Error::Backend {
+            sandbox: NAME.to_owned(),
+            operation: "stop a detached process",
+            message: "process cleanup was refused".to_owned(),
+        })
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_lost_create_reply_retains_the_record_until_named_cleanup_is_acknowledged() -> Result<()>
+{
+    let (sandbox, host, store) = sandbox();
+    host.push_failure("docker connection was interrupted");
+    host.push_failure("daemon temporarily unavailable");
+
+    assert!(sandbox.create(&spec()?).await.is_err());
+    assert_eq!(store.list()?.len(), 1);
+
+    sandbox.destroy(&BoxId::new("box-0")?).await?;
+    assert_eq!(store.list()?.len(), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_lost_create_reply_releases_the_record_after_named_cleanup_succeeds() -> Result<()> {
+    let (sandbox, host, store) = sandbox();
+    host.push_failure("docker connection was interrupted");
+
+    assert!(sandbox.create(&spec()?).await.is_err());
+
+    assert_eq!(store.list()?.len(), 0);
+    let commands = host.commands();
+    assert_eq!(commands.len(), 3);
+    assert_eq!(commands[0].get(1).map(String::as_str), Some("run"));
+    assert_eq!(commands[1].get(1).map(String::as_str), Some("container"));
+    assert_eq!(commands[1].get(2).map(String::as_str), Some("inspect"));
+    assert_eq!(commands[2].get(1).map(String::as_str), Some("rm"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_missing_named_container_completes_destroy_cleanup() -> Result<()> {
+    let (sandbox, host, store) = sandbox();
+    let info = sandbox.create(&spec()?).await?;
+    host.push_failure("Error: No such container: tinybox-default-box-0");
+
+    sandbox.destroy(&info.id).await?;
+
+    assert_eq!(store.list()?.len(), 0);
     Ok(())
 }
 
@@ -526,7 +1300,7 @@ async fn destroying_a_box_removes_the_container_before_the_record() -> Result<()
     assert_eq!(argv[0..2], ["docker", "rm"]);
     assert!(argv.contains(&"--force".to_owned()));
     assert!(argv.contains(&"--volumes".to_owned()));
-    assert_eq!(store.list()?, Vec::<tinybox_core::BoxInfo>::new());
+    assert_eq!(store.list()?.len(), 0);
     Ok(())
 }
 
@@ -554,7 +1328,7 @@ async fn an_unknown_box_is_reported_without_touching_docker() -> Result<()> {
     assert_eq!(sandbox.inspect(&missing).await.err(), expected);
     assert_eq!(sandbox.destroy(&missing).await.err(), expected);
     assert_eq!(sandbox.snapshot(&missing).await.err(), expected);
-    assert_eq!(host.commands(), Vec::<Vec<String>>::new());
+    assert_eq!(host.commands().len(), 0);
     Ok(())
 }
 
@@ -572,7 +1346,7 @@ async fn an_invalid_spec_never_reaches_docker() -> Result<()> {
             limit: "memory_bytes"
         })
     );
-    assert_eq!(host.commands(), Vec::<Vec<String>>::new());
+    assert_eq!(host.commands().len(), 0);
     Ok(())
 }
 
@@ -850,4 +1624,58 @@ fn detach_is_declared_because_a_container_persists_between_commands() {
     let declared = DockerSandbox::declared_capabilities();
 
     assert!(declared.supports(Capability::Detach));
+}
+
+#[test]
+fn preflight_reports_each_enforced_boundary_without_claiming_disk() {
+    use tinybox_core::{Constraint, Enforcement};
+    let (backend, _, _) = sandbox();
+    let support = backend.constraint_support();
+    assert_eq!(
+        support.enforcement(Constraint::Filesystem),
+        Enforcement::Enforced
+    );
+    assert_eq!(
+        support.enforcement(Constraint::Network),
+        Enforcement::Enforced
+    );
+    assert_eq!(support.enforcement(Constraint::Cpu), Enforcement::Enforced);
+    assert_eq!(
+        support.enforcement(Constraint::Memory),
+        Enforcement::Enforced
+    );
+    assert_eq!(support.enforcement(Constraint::Pids), Enforcement::Enforced);
+    assert_eq!(
+        support.enforcement(Constraint::Disk),
+        Enforcement::Unsupported
+    );
+    assert_eq!(
+        support.enforcement(Constraint::Subprocess),
+        Enforcement::Unsupported
+    );
+    assert!(
+        backend
+            .require(&[Constraint::Filesystem, Constraint::Network])
+            .is_ok()
+    );
+    assert!(backend.require(&[Constraint::Disk]).is_err());
+}
+
+#[tokio::test]
+async fn an_unenforceable_network_allowlist_is_refused_at_creation() -> Result<()> {
+    let (sandbox, _host, _store) = sandbox();
+    let policy = tinybox_core::NetworkPolicy::Allowlist(tinybox_core::EgressAllowlist::new(
+        ["example.com"],
+        [443],
+    ));
+    let result = sandbox.create(&spec()?.with_network(policy)).await;
+    assert!(matches!(
+        result,
+        Err(Error::ConstraintNotEnforced {
+            constraint: tinybox_core::Constraint::Network,
+            enforcement: tinybox_core::Enforcement::Unsupported,
+            ..
+        })
+    ));
+    Ok(())
 }

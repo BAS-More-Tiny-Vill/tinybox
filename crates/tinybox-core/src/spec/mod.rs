@@ -44,7 +44,9 @@ use serde::{Deserialize, Serialize};
 
 mod types;
 
-pub use types::{Lifecycle, NetworkPolicy, Placement, PortMapping, Resources, WorkspaceSource};
+pub use types::{
+    EgressAllowlist, Lifecycle, NetworkPolicy, Placement, PortMapping, Resources, WorkspaceSource,
+};
 
 /// The complete description of a box, before any sandbox acts on it.
 ///
@@ -138,7 +140,7 @@ impl BoxSpec {
 
     /// Replace the network policy.
     #[must_use]
-    pub const fn with_network(mut self, network: NetworkPolicy) -> Self {
+    pub fn with_network(mut self, network: NetworkPolicy) -> Self {
         self.network = network;
         self
     }
@@ -168,9 +170,12 @@ impl BoxSpec {
     /// # Errors
     ///
     /// Returns [`Error::ZeroResourceLimit`](crate::error::Error::ZeroResourceLimit)
-    /// naming the first limit that is zero.
+    /// naming the first limit that is zero, or
+    /// [`Error::InvalidNetworkPolicy`](crate::error::Error::InvalidNetworkPolicy)
+    /// for a malformed network allowlist.
     pub fn validate(&self) -> crate::Result<()> {
-        self.resources.validate()
+        self.resources.validate()?;
+        self.network.validate()
     }
 }
 

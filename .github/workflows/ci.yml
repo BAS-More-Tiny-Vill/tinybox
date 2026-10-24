@@ -1,130 +1,17 @@
 name: CI
-
 on:
   push:
+    branches: [main]
   pull_request:
-
+permissions:
+  contents: read
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
-
-permissions:
-  contents: read
-
-env:
-  # Lint levels live in `[lints]` in Cargo.toml so local and CI runs agree;
-  # don't add a blanket RUSTFLAGS here.
-  CARGO_TERM_COLOR: always
-
 jobs:
-  rust:
-    name: Rust
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          # This job executes repository code (cargo build/test); don't persist
-          # the token in git config.
-          persist-credentials: false
-          submodules: true
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      - uses: taiki-e/install-action@cargo-llvm-cov
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-      - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
-
-      - name: Build
-        run: cargo build --all-targets --all-features
-
-      - name: Test
-        run: cargo test --all-features
-
-      - name: Test default features
-        run: cargo test
-
-      - name: Require 90% line coverage in every source file
-        run: .github/scripts/check-file-coverage.sh 90 coverage.json
-
-      - name: Upload coverage report
-        if: ${{ always() }}
-        uses: actions/upload-artifact@v7
-        with:
-          name: coverage-json
-          path: coverage.json
-          if-no-files-found: ignore
-
-  docs:
-    name: Docs
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-          submodules: true
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Build documentation
-        env:
-          RUSTDOCFLAGS: -D warnings
-        run: cargo doc --no-deps --all-features
-
-  msrv:
-    name: Minimum supported Rust version
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-          submodules: true
-
-      - name: Read rust-version from Cargo.toml
-        id: msrv
-        run: |
-          set -euo pipefail
-          # Members inherit `rust-version` from `[workspace.package]`, and
-          # `packages[0]` is arbitrary in a workspace, so take the highest
-          # declared MSRV across every member.
-          msrv="$(cargo metadata --format-version 1 --no-deps \
-            | jq -r '[.packages[].rust_version | select(. != null)]
-                     | sort_by(split(".") | map(tonumber))
-                     | last // ""')"
-          if [[ -z "$msrv" || "$msrv" == "null" ]]; then
-            echo "workspace.package.rust-version is not set in Cargo.toml" >&2
-            exit 1
-          fi
-          echo "version=$msrv" >> "$GITHUB_OUTPUT"
-
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ steps.msrv.outputs.version }}
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Build with the declared MSRV
-        run: cargo build --all-targets --all-features
-
-  supply-chain:
-    name: Supply chain
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-          submodules: true
-
-      - name: Check advisories, licenses, bans, and sources
-        uses: EmbarkStudios/cargo-deny-action@v2
-        with:
-          command: check all
+  module-ci:
+    uses: tinyhumansai/.github/.github/workflows/module-ci.yml@4adc1080fb495098e7af1aade82ed7e6e3c69bb7
+    with:
+      coverage-script: scripts/check-coverage.sh
+      module-e2e-script: scripts/test-e2e.sh
+      feature-test-script: scripts/test-features.sh

@@ -111,7 +111,7 @@ fn it_is_the_only_backend_that_declares_hardware_isolation() {
     assert!(caps.is_suitable_for_untrusted_code());
     // The guest is given fixed vCPUs and fixed memory by the hypervisor and
     // cannot see that any more exists, which is a stronger limit than a cgroup.
-    assert!(caps.supports(Capability::ResourceLimits));
+    assert!(!caps.supports(Capability::ResourceLimits));
     // Each command boots a fresh VM, so there is nothing persistent to capture.
     assert_eq!(caps.snapshot, SnapshotSupport::None);
     assert!(!caps.supports(Capability::Fork));
@@ -305,10 +305,7 @@ async fn sources_it_cannot_build_a_guest_from_are_refused_at_creation() -> Resul
             })
         );
     }
-    assert_eq!(
-        host.commands(),
-        [] as [std::vec::Vec<std::string::String>; 0]
-    );
+    assert_eq!(host.commands().len(), 0);
     Ok(())
 }
 
@@ -387,10 +384,7 @@ async fn an_unknown_box_is_reported_without_booting_anything() -> Result<()> {
             .err(),
         expected
     );
-    assert_eq!(
-        host.commands(),
-        [] as [std::vec::Vec<std::string::String>; 0]
-    );
+    assert_eq!(host.commands().len(), 0);
     Ok(())
 }
 
@@ -620,5 +614,65 @@ async fn the_workspace_root_itself_is_not_written_as_a_file() -> Result<()> {
     let output = sandbox.exec(&info.id, &ExecRequest::new(["true"])).await?;
 
     assert_eq!(output.exit_code, 0);
+    Ok(())
+}
+
+#[test]
+fn preflight_reports_each_enforced_boundary_without_claiming_disk() {
+    use tinybox_core::{Constraint, Enforcement};
+    let backend = sandbox(ScriptedHost::booting("", 0));
+    let support = backend.constraint_support();
+    assert_eq!(
+        support.enforcement(Constraint::Filesystem),
+        Enforcement::Enforced
+    );
+    assert_eq!(
+        support.enforcement(Constraint::Network),
+        Enforcement::Enforced
+    );
+    assert_eq!(
+        support.enforcement(Constraint::Cpu),
+        Enforcement::BestEffort
+    );
+    assert_eq!(
+        support.enforcement(Constraint::Memory),
+        Enforcement::BestEffort
+    );
+    assert_eq!(
+        support.enforcement(Constraint::Pids),
+        Enforcement::Unsupported
+    );
+    assert_eq!(
+        support.enforcement(Constraint::Disk),
+        Enforcement::Unsupported
+    );
+    assert_eq!(
+        support.enforcement(Constraint::Subprocess),
+        Enforcement::Unsupported
+    );
+    assert!(
+        backend
+            .require(&[Constraint::Filesystem, Constraint::Network])
+            .is_ok()
+    );
+    assert!(backend.require(&[Constraint::Disk]).is_err());
+}
+
+#[tokio::test]
+async fn an_unenforceable_network_allowlist_is_refused_at_creation() -> Result<()> {
+    let sandbox = sandbox(ScriptedHost::booting("", 0));
+    let policy = tinybox_core::NetworkPolicy::Allowlist(tinybox_core::EgressAllowlist::new(
+        ["example.com"],
+        [443],
+    ));
+    let result = sandbox.create(&spec()?.with_network(policy)).await;
+    assert!(matches!(
+        result,
+        Err(Error::ConstraintNotEnforced {
+            constraint: tinybox_core::Constraint::Network,
+            enforcement: tinybox_core::Enforcement::Unsupported,
+            ..
+        })
+    ));
     Ok(())
 }

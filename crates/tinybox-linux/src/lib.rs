@@ -40,6 +40,9 @@
 //! command is a fresh sandbox, so writes outside the workspace do not survive
 //! between commands — which is why no snapshot or fork support is declared.
 
+mod probe;
 mod sandbox;
+
+pub use probe::{NamespaceProbe, UsernsStatus};
 
 pub use sandbox::{NAME, NamespaceSandbox, WORKSPACE_MOUNT};

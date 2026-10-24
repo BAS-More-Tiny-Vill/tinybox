@@ -107,6 +107,7 @@ impl PassthroughSandbox {
         }
 
         let mut resolved = ExecRequest::new(request.argv.clone());
+        resolved.stdin.clone_from(&request.stdin);
         resolved.env.clone_from(&spec.env);
         for (key, value) in &request.env {
             resolved.env.insert(key.clone(), value.clone());
@@ -130,7 +131,7 @@ impl PassthroughSandbox {
     /// Returns [`Error::UnknownBox`] when `id` does not resolve,
     /// [`Error::InvalidState`] when the box is not accepting commands, and
     /// [`Error::EmptyCommand`] when the request names no program.
-    fn resolved_for(&self, id: &BoxId, request: &ExecRequest) -> Result<ExecRequest> {
+    pub fn resolve_command(&self, id: &BoxId, request: &ExecRequest) -> Result<ExecRequest> {
         let info = self.store.get(id)?;
         if !info.state.accepts_commands() {
             return Err(Error::InvalidState {
@@ -160,6 +161,7 @@ impl Sandbox for PassthroughSandbox {
 
     async fn create(&self, spec: &BoxSpec) -> Result<BoxInfo> {
         spec.validate()?;
+        spec.network.refuse_allowlist(self.name())?;
         // Fail before recording anything, so a rejected source leaves no box
         // behind for a later command to trip over.
         Self::workspace_dir(spec)?;
@@ -168,8 +170,18 @@ impl Sandbox for PassthroughSandbox {
     }
 
     async fn exec(&self, id: &BoxId, request: &ExecRequest) -> Result<ExecOutput> {
-        let resolved = self.resolved_for(id, request)?;
+        let resolved = self.resolve_command(id, request)?;
         self.host.run(&resolved).await
+    }
+
+    async fn exec_observed(
+        &self,
+        id: &BoxId,
+        request: &ExecRequest,
+        observer: std::sync::Arc<dyn crate::ExecutionObserver>,
+    ) -> Result<ExecOutput> {
+        let resolved = self.resolve_command(id, request)?;
+        self.host.run_observed(&resolved, observer).await
     }
 
     async fn snapshot(&self, _id: &BoxId) -> Result<SnapshotId> {
@@ -198,7 +210,7 @@ impl Sandbox for PassthroughSandbox {
         let process = detach::mint();
         // Resolved first, so the box's own cwd and environment reach the
         // backgrounded command exactly as they would a foreground one.
-        let resolved = self.resolved_for(id, request)?;
+        let resolved = self.resolve_command(id, request)?;
         let started = detach::start(&process, &resolved)?;
         let output = self.host.run(&started).await?;
         if !output.succeeded() {
@@ -212,13 +224,13 @@ impl Sandbox for PassthroughSandbox {
     }
 
     async fn is_running(&self, id: &BoxId, process: &ProcessId) -> Result<bool> {
-        let resolved = self.resolved_for(id, &detach::probe(process))?;
+        let resolved = self.resolve_command(id, &detach::probe(process))?;
         let output = self.host.run(&resolved).await?;
         Ok(output.stdout_lossy().trim() == detach::RUNNING)
     }
 
     async fn stop(&self, id: &BoxId, process: &ProcessId) -> Result<()> {
-        let resolved = self.resolved_for(id, &detach::stop(process, detach::DEFAULT_GRACE))?;
+        let resolved = self.resolve_command(id, &detach::stop(process, detach::DEFAULT_GRACE))?;
         self.host.run(&resolved).await?;
         Ok(())
     }
