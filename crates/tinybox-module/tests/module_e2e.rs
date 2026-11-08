@@ -233,6 +233,8 @@ async fn compiled_module_runs_one_shot_docker_through_a_broker()
                 env: std::collections::BTreeMap::new(),
                 label: None,
                 timeout_ms: 120_000,
+                user: None,
+                pids_limit: None,
             },),
         )
         .await?;
@@ -257,6 +259,8 @@ async fn compiled_module_runs_one_shot_docker_through_a_broker()
                 env: std::collections::BTreeMap::new(),
                 label: None,
                 timeout_ms: 120_000,
+                user: None,
+                pids_limit: None,
             },),
         )
         .await?;

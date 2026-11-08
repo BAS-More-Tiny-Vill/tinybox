@@ -338,6 +338,8 @@ async fn run_docker_preserves_one_shot_settings_output_and_timeout()
         .into(),
         label: Some("openhuman.sandbox=true".into()),
         timeout_ms: 120_000,
+        user: None,
+        pids_limit: None,
     };
     let output = run_with_cli(&DockerCli::with_program(&script_path), request, true).await?;
     assert_eq!(output.exit_code, 3);
@@ -398,6 +400,8 @@ async fn run_without_workspace_preserves_docker_settings_without_host_mounts()
         env: [("MODE".into(), "preserved".into())].into(),
         label: Some("openhuman.sandbox=true".into()),
         timeout_ms: 12_000,
+        user: None,
+        pids_limit: None,
     };
     let output = run_without_workspace(&DockerCli::with_program(&script_path), request).await?;
     assert_eq!(output.exit_code, 0);
@@ -443,6 +447,8 @@ fn validation_rejects_unbounded_runtime() -> std::result::Result<(), Box<dyn std
         env: std::collections::BTreeMap::new(),
         label: None,
         timeout_ms: MAX_DOCKER_RUN_TIMEOUT_MS + 1,
+        user: None,
+        pids_limit: None,
     };
     let error = validate(&request, true)
         .err()
@@ -468,6 +474,8 @@ fn no_workspace_request_rejects_an_ambiguous_workspace_path()
         env: std::collections::BTreeMap::new(),
         label: None,
         timeout_ms: 1000,
+        user: None,
+        pids_limit: None,
     };
     let error = validate(&request, false)
         .err()
@@ -509,6 +517,8 @@ fn policy_request(network: Option<&str>, mounts: &[&str], workspace: &str) -> Do
         env: std::collections::BTreeMap::new(),
         label: None,
         timeout_ms: 1000,
+        user: None,
+        pids_limit: None,
     }
 }
 
@@ -536,4 +546,116 @@ fn docker_run_accepts_ordinary_isolated_requests() {
 #[test]
 fn workspace_less_run_still_refuses_host_network() {
     assert!(validate(&policy_request(Some("host"), &[], ""), false).is_err());
+}
+
+// ---- DEF-32: --user, --pids-limit, and the read-back reported to the host ----
+
+/// A fake CLI for the verified path: records `create`'s argv (NUL separated)
+/// and every call, and answers `inspect` with `inspect`.
+fn verified_cli(
+    dir: &Path,
+    inspect: &str,
+) -> std::io::Result<(DockerCli, std::path::PathBuf, std::path::PathBuf)> {
+    let argv_file = dir.join("create.bin");
+    let calls = dir.join("calls");
+    let script_path = dir.join("docker");
+    write_cli_fixture(
+        &script_path,
+        format!(
+            "#!/bin/sh\necho \"$1\" >> '{calls}'\ncase \"$1\" in\n\
+             create) : > '{argv}'; for a in \"$@\"; do printf '%s\\0' \"$a\" >> '{argv}'; done; echo cid-9;;\n\
+             inspect) echo '{inspect}';;\n\
+             start) printf out; printf err >&2; exit 4;;\n\
+             esac\n",
+            calls = calls.display(),
+            argv = argv_file.display(),
+        ),
+    )?;
+    Ok((DockerCli::with_program(&script_path), argv_file, calls))
+}
+
+fn hardened_request(workspace: &Path) -> DockerRunRequest {
+    let mut request = policy_request(None, &[], &workspace.display().to_string());
+    request.user = Some("1000:1000".into());
+    request.pids_limit = Some(256);
+    request.timeout_ms = 20_000;
+    request
+}
+
+#[tokio::test]
+async fn def32_user_and_pids_limit_reach_the_container_and_are_read_back()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let (cli, argv_file, calls) = verified_cli(temp.path(), "536870912 256 1000:1000")?;
+    let output = run_with_cli(&cli, hardened_request(temp.path()), true).await?;
+    assert_eq!(output.exit_code, 4);
+    assert_eq!(output.stdout, "out");
+    assert_eq!(output.stderr, "err");
+    assert_eq!(
+        output.observed_limits,
+        Some(tinybox_bus::DockerObservedLimits {
+            memory_bytes: 536_870_912,
+            pids_limit: Some(256),
+            user: "1000:1000".into(),
+        })
+    );
+    let argv: Vec<String> = std::fs::read(&argv_file)?
+        .split(|byte| *byte == 0)
+        .filter(|part| !part.is_empty())
+        .map(|part| String::from_utf8_lossy(part).into_owned())
+        .collect();
+    assert_eq!(argv[0], "create");
+    assert!(has_pair(&argv, "--user", "1000:1000"), "{argv:?}");
+    assert!(has_pair(&argv, "--pids-limit", "256"), "{argv:?}");
+    assert_eq!(
+        std::fs::read_to_string(&calls)?,
+        "create\ninspect\nstart\n"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn def32_a_run_whose_limits_are_not_in_force_never_starts()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let (cli, _, calls) = verified_cli(temp.path(), "536870912 <nil> ")?;
+    let error = run_with_cli(&cli, hardened_request(temp.path()), true)
+        .await
+        .err()
+        .ok_or("a run without its limits in force must fail")?;
+    assert_eq!(error.wire_name(), tinybox_bus::INVALID_DOCKER_RUN);
+    assert_eq!(std::fs::read_to_string(&calls)?, "create\ninspect\nrm\n");
+    Ok(())
+}
+
+#[tokio::test]
+async fn def32_requests_without_user_or_pids_keep_the_plain_run_and_report_no_read_back()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let (cli, _, calls) = verified_cli(temp.path(), "unused")?;
+    let mut request = policy_request(None, &[], &temp.path().display().to_string());
+    request.timeout_ms = 20_000;
+    let output = run_with_cli(&cli, request, true).await?;
+    assert_eq!(output.observed_limits, None);
+    assert_eq!(std::fs::read_to_string(&calls)?, "run\n");
+    Ok(())
+}
+
+#[test]
+fn def32_user_must_be_numeric_uid_gid_and_pids_limit_positive() {
+    let with = |user: Option<&str>, pids: Option<u64>| {
+        let mut request = policy_request(None, &[], "/work");
+        request.user = user.map(str::to_owned);
+        request.pids_limit = pids;
+        validate(&request, true)
+    };
+    assert!(with(Some("1000:1000"), Some(256)).is_ok());
+    assert!(with(Some("65534:65534"), None).is_ok());
+    for bad in ["root", "1000", "1000:", ":1000", "a:b", "1000:1000:1", "-1:0", " 1:1"] {
+        assert!(
+            matches!(with(Some(bad), None), Err(e) if e.wire_name() == tinybox_bus::INVALID_DOCKER_RUN),
+            "{bad}"
+        );
+    }
+    assert!(with(None, Some(0)).is_err());
 }

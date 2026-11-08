@@ -53,6 +53,8 @@ fn docker_run_vocabulary_is_typed_bounded_and_additive() -> Result<(), serde_jso
         env: BTreeMap::from([("MODE".into(), "test".into())]),
         label: Some("openhuman.sandbox=true".into()),
         timeout_ms: 120_000,
+        user: None,
+        pids_limit: None,
     };
     assert_eq!(METHODS[26], "RunDocker");
     assert_eq!(METHODS[27], "DockerStatus");
@@ -454,5 +456,48 @@ fn native_shell_request_hides_no_window_unless_asked() -> Result<(), serde_json:
         "hide_window": true
     }))?;
     assert!(request.hide_window);
+    Ok(())
+}
+
+#[test]
+fn def32_docker_user_pids_and_read_back_are_additive_and_omitted_when_unset()
+-> Result<(), serde_json::Error> {
+    // An existing caller's request carries no new keys on the wire.
+    let plain: DockerRunRequest = serde_json::from_value(serde_json::json!({
+        "workspace": "/tmp/workspace", "command": "true"
+    }))?;
+    assert_eq!(plain.user, None);
+    assert_eq!(plain.pids_limit, None);
+    let wire = serde_json::to_value(&plain)?;
+    assert!(wire.get("user").is_none() && wire.get("pids_limit").is_none());
+
+    let hardened: DockerRunRequest = serde_json::from_value(serde_json::json!({
+        "workspace": "/tmp/workspace", "command": "true",
+        "user": "1000:1000", "pids_limit": 256
+    }))?;
+    assert_eq!(hardened.user.as_deref(), Some("1000:1000"));
+    assert_eq!(hardened.pids_limit, Some(256));
+
+    // A module that predates the read-back sends no `observed_limits`: the host
+    // sees `None`, which is how it tells "not read back" from "read back".
+    let old: DockerRunOutput = serde_json::from_value(serde_json::json!({
+        "exit_code": 0, "stdout": "", "stderr": "", "timed_out": false
+    }))?;
+    assert_eq!(old.observed_limits, None);
+    let read_back = DockerRunOutput {
+        exit_code: 0,
+        stdout: String::new(),
+        stderr: String::new(),
+        timed_out: false,
+        observed_limits: Some(DockerObservedLimits {
+            memory_bytes: 536_870_912,
+            pids_limit: Some(256),
+            user: "1000:1000".into(),
+        }),
+    };
+    assert_eq!(
+        serde_json::from_value::<DockerRunOutput>(serde_json::to_value(&read_back)?)?,
+        read_back
+    );
     Ok(())
 }
