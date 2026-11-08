@@ -437,3 +437,245 @@ async fn audit_m1_env_values_reach_the_client_but_never_its_argv() {
     assert!(!argv.iter().any(|arg| arg.contains("s3cret")), "{argv:?}");
     assert_eq!(outcome.stdout, "s3cret");
 }
+
+// ---- DEF-32: non-root user, process cap, and read-back of observed limits ----
+
+fn hardened(workspace: &Path) -> OneShot {
+    OneShot::new(workspace, "id -u")
+        .with_label("openhuman.sandbox=true")
+        .with_user(1000, 1000)
+        .with_pids_limit(256)
+}
+
+#[test]
+fn def32_user_and_pids_limit_follow_the_cpu_limit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut expected = s(&[
+        "run",
+        "--rm",
+        "--label",
+        "openhuman.sandbox=true",
+        "--network",
+        "none",
+        "--cap-drop",
+        "ALL",
+        "-m",
+        "512m",
+        "--cpus",
+        "1",
+        "--pids-limit",
+        "256",
+        "--user",
+        "1000:1000",
+        "--read-only",
+        "--tmpfs",
+        "/tmp:rw,noexec,nosuid,size=64m",
+        "--tmpfs",
+        "/var/tmp:rw,noexec,nosuid,size=64m",
+        "--security-opt",
+        "no-new-privileges",
+        "-v",
+    ]);
+    expected.push(format!("{}:/workspace", canon(tmp.path())));
+    expected.extend(s(&["-w", "/workspace", "--", "alpine:3.20", "sh", "-c", "id -u"]));
+    assert_eq!(strings(&hardened(tmp.path()).argv()), expected);
+}
+
+#[test]
+fn def32_user_and_pids_limit_are_opt_in() {
+    let tmp = tempfile::tempdir().unwrap();
+    let argv = strings(&OneShot::new(tmp.path(), "true").argv());
+    assert!(!argv.iter().any(|a| a == "--user" || a == "--pids-limit"), "{argv:?}");
+}
+
+#[test]
+fn def32_expected_limits_describe_the_spec() {
+    let tmp = tempfile::tempdir().unwrap();
+    assert_eq!(
+        hardened(tmp.path()).with_memory_mb(256).expected_limits(),
+        ObservedLimits {
+            memory_bytes: 256 * 1024 * 1024,
+            pids_limit: Some(256),
+            user: "1000:1000".into(),
+        }
+    );
+    assert_eq!(
+        OneShot::new(tmp.path(), "true").expected_limits(),
+        ObservedLimits {
+            memory_bytes: 512 * 1024 * 1024,
+            pids_limit: None,
+            user: String::new(),
+        }
+    );
+}
+
+#[test]
+fn def32_observed_limits_parse_docker_inspect_output() {
+    assert_eq!(
+        ObservedLimits::parse("536870912 256 1000:1000\n"),
+        Some(ObservedLimits {
+            memory_bytes: 536_870_912,
+            pids_limit: Some(256),
+            user: "1000:1000".into(),
+        })
+    );
+    // An unset user prints nothing; an unset pids limit prints `<nil>`, `0` or `-1`.
+    for unset in ["<nil>", "0", "-1"] {
+        assert_eq!(
+            ObservedLimits::parse(&format!("536870912 {unset} \n")),
+            Some(ObservedLimits {
+                memory_bytes: 536_870_912,
+                pids_limit: None,
+                user: String::new(),
+            }),
+            "{unset}"
+        );
+    }
+    assert_eq!(ObservedLimits::parse(""), None);
+    assert_eq!(ObservedLimits::parse("lots of garbage here"), None);
+    assert_eq!(ObservedLimits::parse("1 2 3:3 extra"), None);
+}
+
+/// A fake client that appends each call (space separated) to `calls`, then
+/// answers `create`, `inspect`, `start` and `rm` as scripted.
+fn fake_verified(dir: &Path, inspect: &str, start: &str) -> (DockerCli, PathBuf) {
+    let calls = dir.join("calls");
+    let script = format!(
+        "#!/bin/sh\n[ \"$1\" = --tinybox-probe ] && exit 0\necho \"$*\" >> '{calls}'\n\
+         case \"$1\" in\n\
+         create) echo cid-1;;\n\
+         inspect) printf '%s\\n' '{inspect}';;\n\
+         start) {start};;\n\
+         esac\n",
+        calls = calls.display(),
+    );
+    let path = dir.join("docker");
+    std::fs::write(&path, script).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    wait_until_executable(&path);
+    (DockerCli::with_program(&path), calls)
+}
+
+fn calls(path: &Path) -> Vec<String> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+#[tokio::test]
+async fn def32_verified_run_creates_reads_back_then_starts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (cli, log) = fake_verified(
+        tmp.path(),
+        "536870912 256 1000:1000",
+        "echo 1000; echo warn >&2; exit 3",
+    );
+    let spec = hardened(tmp.path());
+    let got = cli
+        .run_one_shot_verified(&spec, Duration::from_secs(20))
+        .await
+        .unwrap();
+    assert_eq!(
+        got.outcome,
+        OneShotOutcome {
+            exit_code: 3,
+            stdout: "1000\n".into(),
+            stderr: "warn\n".into(),
+            timed_out: false,
+        }
+    );
+    assert_eq!(got.observed, spec.expected_limits());
+
+    let log = calls(&log);
+    assert_eq!(log.len(), 3, "{log:?}");
+    // `create` carries the run's own label, then exactly the spec's argv after `run`.
+    let created: Vec<&str> = log[0].split(' ').collect();
+    assert_eq!(created[0], "create");
+    assert_eq!(created[1], "--rm");
+    assert_eq!(created[2], "--label");
+    assert!(created[3].starts_with("ai.tinyhumans.tinybox.oneshot="));
+    let tail: Vec<String> = strings(&spec.argv())[2..]
+        .iter()
+        .flat_map(|a| a.split(' ').map(str::to_owned).collect::<Vec<_>>())
+        .collect();
+    assert_eq!(created[4..], tail.iter().map(String::as_str).collect::<Vec<_>>()[..]);
+    assert_eq!(log[1], format!("inspect --format {OBSERVED_LIMITS_FORMAT} cid-1"));
+    assert_eq!(log[2], "start -a cid-1");
+}
+
+#[tokio::test]
+async fn def32_verified_run_refuses_a_container_whose_limits_are_not_in_force() {
+    let tmp = tempfile::tempdir().unwrap();
+    // The daemon reports no pids limit and no user: the flags did not take.
+    let (cli, log) = fake_verified(tmp.path(), "536870912 <nil> ", "echo ran");
+    let err = cli
+        .run_one_shot_verified(&hardened(tmp.path()), Duration::from_secs(20))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("not in force"), "{err}");
+    let log = calls(&log);
+    assert!(!log.iter().any(|c| c.starts_with("start")), "{log:?}");
+    assert_eq!(log.last().map(String::as_str), Some("rm -f cid-1"), "{log:?}");
+}
+
+#[tokio::test]
+async fn def32_verified_run_refuses_unreadable_inspect_output() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (cli, log) = fake_verified(tmp.path(), "not a limit line at all", "echo ran");
+    assert!(cli
+        .run_one_shot_verified(&hardened(tmp.path()), Duration::from_secs(20))
+        .await
+        .is_err());
+    let log = calls(&log);
+    assert!(!log.iter().any(|c| c.starts_with("start")), "{log:?}");
+    assert_eq!(log.last().map(String::as_str), Some("rm -f cid-1"), "{log:?}");
+}
+
+#[tokio::test]
+async fn def32_verified_run_times_out_and_kills_by_its_own_label() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (cli, log) = fake_verified(tmp.path(), "536870912 256 1000:1000", "exec sleep 5");
+    let got = cli
+        .run_one_shot_verified(&hardened(tmp.path()), Duration::from_millis(500))
+        .await
+        .unwrap();
+    assert!(got.outcome.timed_out);
+    assert_eq!(got.outcome.exit_code, -1);
+    let log = calls(&log);
+    let label = log[0].split(' ').nth(3).unwrap().to_owned();
+    assert!(
+        log.iter().any(|c| c == &format!("ps -q --filter label={label}")),
+        "{log:?}"
+    );
+}
+
+/// Real daemon: set `TINYBOX_DOCKER_E2E=1` on a host with Docker.
+#[tokio::test]
+async fn def32_e2e_limits_are_in_force_on_a_real_daemon() {
+    if std::env::var_os("TINYBOX_DOCKER_E2E").is_none() {
+        eprintln!("skipped: TINYBOX_DOCKER_E2E is not set");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let spec = OneShot::new(tmp.path(), "id -u; id -g; cat /sys/fs/cgroup/pids.max")
+        .without_workspace()
+        .with_user(65534, 65534)
+        .with_pids_limit(64)
+        .with_memory_mb(128);
+    let got = DockerCli::new()
+        .run_one_shot_verified(&spec, Duration::from_secs(120))
+        .await
+        .unwrap();
+    assert_eq!(got.outcome.exit_code, 0, "{:?}", got.outcome);
+    assert_eq!(got.outcome.stdout, "65534\n65534\n64\n");
+    assert_eq!(
+        got.observed,
+        ObservedLimits {
+            memory_bytes: 128 * 1024 * 1024,
+            pids_limit: Some(64),
+            user: "65534:65534".into(),
+        }
+    );
+}
