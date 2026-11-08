@@ -251,6 +251,8 @@ async fn new_module_operations_dispatch_and_preserve_validation_errors() -> tiny
             env: std::collections::BTreeMap::new(),
             label: None,
             timeout_ms: tinybox_bus::MAX_DOCKER_RUN_TIMEOUT_MS + 1,
+            user: None,
+            pids_limit: None,
         })
         .await;
     assert!(docker.is_err());
@@ -270,6 +272,8 @@ async fn new_module_operations_dispatch_and_preserve_validation_errors() -> tiny
             env: std::collections::BTreeMap::new(),
             label: None,
             timeout_ms: 1000,
+            user: None,
+            pids_limit: None,
         })
         .await;
     assert!(docker_without_workspace.is_err());
