@@ -524,6 +524,29 @@ pub struct DockerRunRequest {
     /// Maximum command runtime in milliseconds.
     #[serde(default = "default_docker_run_timeout_ms")]
     pub timeout_ms: u64,
+    /// Numeric `uid:gid` the command runs as (`--user`); `None` keeps the
+    /// image's default user. Setting this or `pids_limit` makes the module read
+    /// the container's limits back before the command starts, refuse to start
+    /// it when they are not in force, and report them in
+    /// [`DockerRunOutput::observed_limits`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// Maximum number of processes in the container (`--pids-limit`); must be
+    /// positive. See `user` for the read-back it triggers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pids_limit: Option<u64>,
+}
+
+/// Container limits the module read back with `docker inspect` before the
+/// command started.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DockerObservedLimits {
+    /// `HostConfig.Memory`, in bytes.
+    pub memory_bytes: u64,
+    /// `HostConfig.PidsLimit`; `None` when unset or unlimited.
+    pub pids_limit: Option<i64>,
+    /// `Config.User`; empty when the image default applies.
+    pub user: String,
 }
 
 /// Bounded result from one Docker command.
@@ -537,6 +560,11 @@ pub struct DockerRunOutput {
     pub stderr: String,
     /// Whether the module stopped the command after its deadline.
     pub timed_out: bool,
+    /// The limits read back before the command started; present only when the
+    /// request set `user` or `pids_limit`. A host that asked for them and gets
+    /// `None` is talking to a module that did not verify them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_limits: Option<DockerObservedLimits>,
 }
 
 /// Check whether the module's Docker daemon responds within a bounded interval.

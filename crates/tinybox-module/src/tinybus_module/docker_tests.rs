@@ -607,10 +607,7 @@ async fn def32_user_and_pids_limit_reach_the_container_and_are_read_back()
     assert_eq!(argv[0], "create");
     assert!(has_pair(&argv, "--user", "1000:1000"), "{argv:?}");
     assert!(has_pair(&argv, "--pids-limit", "256"), "{argv:?}");
-    assert_eq!(
-        std::fs::read_to_string(&calls)?,
-        "create\ninspect\nstart\n"
-    );
+    assert_eq!(std::fs::read_to_string(&calls)?, "create\ninspect\nstart\n");
     Ok(())
 }
 
@@ -651,7 +648,16 @@ fn def32_user_must_be_numeric_uid_gid_and_pids_limit_positive() {
     };
     assert!(with(Some("1000:1000"), Some(256)).is_ok());
     assert!(with(Some("65534:65534"), None).is_ok());
-    for bad in ["root", "1000", "1000:", ":1000", "a:b", "1000:1000:1", "-1:0", " 1:1"] {
+    for bad in [
+        "root",
+        "1000",
+        "1000:",
+        ":1000",
+        "a:b",
+        "1000:1000:1",
+        "-1:0",
+        " 1:1",
+    ] {
         assert!(
             matches!(with(Some(bad), None), Err(e) if e.wire_name() == tinybox_bus::INVALID_DOCKER_RUN),
             "{bad}"

@@ -138,17 +138,58 @@ async fn run_with_cli(
     if let Some(label) = request.label {
         spec = spec.with_label(label);
     }
+    let user = request.user.as_deref().and_then(parse_user);
+    if let Some((uid, gid)) = user {
+        spec = spec.with_user(uid, gid);
+    }
+    if let Some(pids_limit) = request.pids_limit {
+        spec = spec.with_pids_limit(pids_limit);
+    }
 
-    let outcome = cli
-        .run_one_shot(&spec, Duration::from_millis(request.timeout_ms))
+    let timeout = Duration::from_millis(request.timeout_ms);
+    if user.is_none() && request.pids_limit.is_none() {
+        let outcome = cli
+            .run_one_shot(&spec, timeout)
+            .await
+            .map_err(|_| failure("Docker client could not be started"))?;
+        return Ok(DockerRunOutput {
+            exit_code: outcome.exit_code,
+            stdout: outcome.stdout,
+            stderr: outcome.stderr,
+            timed_out: outcome.timed_out,
+            observed_limits: None,
+        });
+    }
+
+    // DEF-32: a requested limit is not evidence that it is in force. Read it
+    // back before the command starts, and do not start it otherwise.
+    let verified = cli
+        .run_one_shot_verified(&spec, timeout)
         .await
-        .map_err(|_| failure("Docker client could not be started"))?;
+        .map_err(|error| failure(&format!("Docker limits could not be verified: {error}")))?;
+    let observed = verified.observed;
     Ok(DockerRunOutput {
-        exit_code: outcome.exit_code,
-        stdout: outcome.stdout,
-        stderr: outcome.stderr,
-        timed_out: outcome.timed_out,
+        exit_code: verified.outcome.exit_code,
+        stdout: verified.outcome.stdout,
+        stderr: verified.outcome.stderr,
+        timed_out: verified.outcome.timed_out,
+        observed_limits: Some(tinybox_bus::DockerObservedLimits {
+            memory_bytes: observed.memory_bytes,
+            pids_limit: observed.pids_limit,
+            user: observed.user,
+        }),
     })
+}
+
+/// Parse a numeric `uid:gid`; names and partial forms are refused.
+fn parse_user(user: &str) -> Option<(u32, u32)> {
+    let (uid, gid) = user.split_once(':')?;
+    let numeric = |part: &str| {
+        (!part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| part.parse::<u32>().ok())
+            .flatten()
+    };
+    Some((numeric(uid)?, numeric(gid)?))
 }
 
 fn validate(request: &DockerRunRequest, mount_workspace: bool) -> Result<()> {
@@ -156,6 +197,16 @@ fn validate(request: &DockerRunRequest, mount_workspace: bool) -> Result<()> {
         || (!mount_workspace && !request.workspace.is_empty())
     {
         return Err(failure("Docker run request is invalid"));
+    }
+    if request
+        .user
+        .as_deref()
+        .is_some_and(|user| parse_user(user).is_none())
+        || request.pids_limit == Some(0)
+    {
+        return Err(failure(
+            "Docker run request is invalid: user must be numeric uid:gid and pids_limit positive",
+        ));
     }
     let issues = tinybox_docker::run_policy_issues(
         request.network.as_deref(),
