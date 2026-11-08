@@ -457,7 +457,9 @@ impl DockerCli {
         let mut create = Command::new(&self.program);
         create.args(argv);
         create.envs(spec.env.iter().map(|(key, value)| (key, value)));
-        let created = self.bounded_output(create, deadline, "docker create").await?;
+        let created = self
+            .bounded_output(create, deadline, "docker create")
+            .await?;
         if !created.status.success() {
             return Err(io::Error::other(format!(
                 "docker create failed: {}",
@@ -498,7 +500,9 @@ impl DockerCli {
     ) -> io::Result<ObservedLimits> {
         let mut inspect = Command::new(&self.program);
         inspect.args(["inspect", "--format", OBSERVED_LIMITS_FORMAT, id]);
-        let out = self.bounded_output(inspect, deadline, "docker inspect").await?;
+        let out = self
+            .bounded_output(inspect, deadline, "docker inspect")
+            .await?;
         if !out.status.success() {
             return Err(io::Error::other(format!(
                 "docker inspect failed: {}",
@@ -525,7 +529,12 @@ impl DockerCli {
         cmd.kill_on_drop(true);
         tokio::time::timeout_at(deadline, cmd.output())
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, format!("{what} exceeded its deadline")))?
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("{what} exceeded its deadline"),
+                )
+            })?
     }
 
     /// Best effort: force-remove a created container that must not run.
@@ -572,7 +581,7 @@ impl DockerCli {
                 // ponytail: `ps -q` misses a container created but not yet
                 // started; `ps -aq` + `rm -f` if that window matters.
                 let _ =
-                    tokio::time::timeout(Duration::from_secs(10), self.kill_labelled(&run_label))
+                    tokio::time::timeout(Duration::from_secs(10), self.kill_labelled(run_label))
                         .await;
                 Ok(OneShotOutcome {
                     exit_code: -1,

@@ -477,7 +477,15 @@ fn def32_user_and_pids_limit_follow_the_cpu_limit() {
         "-v",
     ]);
     expected.push(format!("{}:/workspace", canon(tmp.path())));
-    expected.extend(s(&["-w", "/workspace", "--", "alpine:3.20", "sh", "-c", "id -u"]));
+    expected.extend(s(&[
+        "-w",
+        "/workspace",
+        "--",
+        "alpine:3.20",
+        "sh",
+        "-c",
+        "id -u",
+    ]));
     assert_eq!(strings(&hardened(tmp.path()).argv()), expected);
 }
 
@@ -485,7 +493,10 @@ fn def32_user_and_pids_limit_follow_the_cpu_limit() {
 fn def32_user_and_pids_limit_are_opt_in() {
     let tmp = tempfile::tempdir().unwrap();
     let argv = strings(&OneShot::new(tmp.path(), "true").argv());
-    assert!(!argv.iter().any(|a| a == "--user" || a == "--pids-limit"), "{argv:?}");
+    assert!(
+        !argv.iter().any(|a| a == "--user" || a == "--pids-limit"),
+        "{argv:?}"
+    );
 }
 
 #[test]
@@ -600,8 +611,14 @@ async fn def32_verified_run_creates_reads_back_then_starts() {
         .iter()
         .flat_map(|a| a.split(' ').map(str::to_owned).collect::<Vec<_>>())
         .collect();
-    assert_eq!(created[4..], tail.iter().map(String::as_str).collect::<Vec<_>>()[..]);
-    assert_eq!(log[1], format!("inspect --format {OBSERVED_LIMITS_FORMAT} cid-1"));
+    assert_eq!(
+        created[4..],
+        tail.iter().map(String::as_str).collect::<Vec<_>>()[..]
+    );
+    assert_eq!(
+        log[1],
+        format!("inspect --format {OBSERVED_LIMITS_FORMAT} cid-1")
+    );
     assert_eq!(log[2], "start -a cid-1");
 }
 
@@ -617,20 +634,29 @@ async fn def32_verified_run_refuses_a_container_whose_limits_are_not_in_force() 
     assert!(err.to_string().contains("not in force"), "{err}");
     let log = calls(&log);
     assert!(!log.iter().any(|c| c.starts_with("start")), "{log:?}");
-    assert_eq!(log.last().map(String::as_str), Some("rm -f cid-1"), "{log:?}");
+    assert_eq!(
+        log.last().map(String::as_str),
+        Some("rm -f cid-1"),
+        "{log:?}"
+    );
 }
 
 #[tokio::test]
 async fn def32_verified_run_refuses_unreadable_inspect_output() {
     let tmp = tempfile::tempdir().unwrap();
     let (cli, log) = fake_verified(tmp.path(), "not a limit line at all", "echo ran");
-    assert!(cli
-        .run_one_shot_verified(&hardened(tmp.path()), Duration::from_secs(20))
-        .await
-        .is_err());
+    assert!(
+        cli.run_one_shot_verified(&hardened(tmp.path()), Duration::from_secs(20))
+            .await
+            .is_err()
+    );
     let log = calls(&log);
     assert!(!log.iter().any(|c| c.starts_with("start")), "{log:?}");
-    assert_eq!(log.last().map(String::as_str), Some("rm -f cid-1"), "{log:?}");
+    assert_eq!(
+        log.last().map(String::as_str),
+        Some("rm -f cid-1"),
+        "{log:?}"
+    );
 }
 
 #[tokio::test]
@@ -646,7 +672,8 @@ async fn def32_verified_run_times_out_and_kills_by_its_own_label() {
     let log = calls(&log);
     let label = log[0].split(' ').nth(3).unwrap().to_owned();
     assert!(
-        log.iter().any(|c| c == &format!("ps -q --filter label={label}")),
+        log.iter()
+            .any(|c| c == &format!("ps -q --filter label={label}")),
         "{log:?}"
     );
 }
