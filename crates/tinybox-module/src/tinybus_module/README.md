@@ -454,3 +454,28 @@ until targeted deadline cleanup completes. The contract version cannot detect
 this extension, so hosts must not gate on it: they must treat absent `killed`
 evidence as unknown cleanup and must not infer a confirmed kill from `timed_out`
 alone; see `docs/specs/contract-2-1.md` (the fork Docker extension document).
+
+The Docker run members also accept a caller-supplied numeric `user` (uid 0
+and gid 0 are refused) and a `pids_limit` of 1 to 256; `memory_limit_mb: 0`
+(unlimited to Docker) is refused too. Every run, with or without those fields,
+is verified: the module first probes `docker info` and refuses with the
+distinct error `DockerLimitsUnenforceable` (nothing created) when the daemon
+reports it cannot enforce the process cap or memory limit; it then creates the
+container, reads the effective limits back with `docker inspect`, never starts
+one whose limits are not in force, and reports them in `observed_limits`. A
+probe that fails or overruns the deadline is `InvalidDockerRun`, not a refusal.
+Environment values reach only the container, through a private `--env-file`,
+never a Docker command line. `CleanupDocker` lists with `docker ps -a`, so it
+also finds created-but-never-started containers.
+
+Because an older module would ignore those fields and skip the verification,
+`Capabilities` lists the explicit capability `docker-run-hardened-v1` in its
+optional `features` array, and only a module that enforces the non-root /
+256-process floor, the probe and the read-back on every run lists it. Hosts
+must check `tinybox_bus::supports_hardened_docker_run` (or
+`tinybox_bus::docker_run_request_is_supported` for a given request) before
+sending `user` or `pids_limit`, not the contract version; a host that requires
+the floor for every run uses `docker_run_request_is_supported_with_policy` with
+`HardenedDockerRunPolicy::Always`. `features` is a public-field addition:
+downstream `ModuleCapabilities` struct literals need the field or
+`..Default::default()`. See `docs/specs/contract-2-1.md`.

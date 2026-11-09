@@ -92,7 +92,14 @@ pub use files::{
 /// `killed` and `duration_ms` evidence fields from this fork's Docker
 /// one-shot extension (docs/specs/contract-2-1.md; not upstream's 2.1). They
 /// are additive, default to `None` when a module omits them, and no contract
-/// version identifies them.
+/// version identifies them. The same holds for the optional
+/// [`DockerRunRequest`] `user` and `pids_limit` fields and
+/// [`DockerRunOutput`] `observed_limits` (DEF-32), except that those are
+/// security-critical, so a module advertises that it enforces them (and the
+/// floor, probe and read-back on every run) with the explicit
+/// [`HARDENED_DOCKER_RUN_FEATURE`] capability in
+/// [`ModuleCapabilities::features`]; see [`supports_hardened_docker_run`].
+/// The [`DOCKER_LIMITS_UNENFORCEABLE`] error name rides inside 2.3 the same way.
 pub const CONTRACT_VERSION: (u32, u32) = (2, 3);
 
 /// Minimum contract version required for resource-aware native jail members.
@@ -103,6 +110,95 @@ pub const NATIVE_JAIL_RESOURCES_VERSION: (u32, u32) = (2, 1);
 #[must_use]
 pub fn supports_native_jail_resources(module: (u32, u32)) -> bool {
     module.0 == NATIVE_JAIL_RESOURCES_VERSION.0 && module.1 >= NATIVE_JAIL_RESOURCES_VERSION.1
+}
+
+/// Capability a module lists in [`ModuleCapabilities::features`] when, on
+/// EVERY `RunDocker` and `RunDockerWithoutWorkspace` call (whether or not the
+/// request sets `user` or `pids_limit`), it:
+///
+/// - enforces the floor: a numeric non-root identity (never uid 0 or gid 0;
+///   the workspace owner, else `65534:65534`, when `user` is unset) and a
+///   process cap of at most 256;
+/// - honours an explicit [`DockerRunRequest`] `user` / `pids_limit` only
+///   within that floor (a pids limit can tighten the cap, never loosen it);
+/// - probes the daemon (`docker info`) before anything is created and refuses
+///   the run with [`DOCKER_LIMITS_UNENFORCEABLE`] when it reports it cannot
+///   enforce the process cap or the memory limit;
+/// - creates the container, reads its effective limits back with
+///   `docker inspect` before start, refuses to start one whose limits are not
+///   in force, and reports them in [`DockerRunOutput::observed_limits`].
+///
+/// Fork extension carried inside contract 2.3; no contract version identifies
+/// it. A module without it (for example unmodified upstream 2.3) ignores the
+/// unknown request fields and runs with its old behaviour.
+pub const HARDENED_DOCKER_RUN_FEATURE: &str = "docker-run-hardened-v1";
+
+/// Whether a module explicitly advertises [`HARDENED_DOCKER_RUN_FEATURE`]
+/// (exact name, equal contract major), that is, whether it enforces the
+/// non-root / 256-process floor, the enforcement probe and the limit
+/// read-back on every Docker run.
+///
+/// Hosts must check this before sending a [`DockerRunRequest`] that sets
+/// `user` or `pids_limit`, and a host whose policy requires the floor must
+/// check it before sending any Docker run request; the contract version
+/// cannot detect the extension. See [`docker_run_request_is_supported_with_policy`].
+#[must_use]
+pub fn supports_hardened_docker_run(capabilities: &ModuleCapabilities) -> bool {
+    capabilities.contract_version.0 == CONTRACT_VERSION.0
+        && capabilities
+            .features
+            .iter()
+            .any(|feature| feature == HARDENED_DOCKER_RUN_FEATURE)
+}
+
+/// When a host requires [`HARDENED_DOCKER_RUN_FEATURE`] before sending a
+/// [`DockerRunRequest`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HardenedDockerRunPolicy {
+    /// Only for requests that set `user` or `pids_limit`; plain requests may
+    /// go to any module (an older one runs them with its own defaults). This
+    /// is what [`docker_run_request_is_supported`] checks.
+    #[default]
+    WhenRequested,
+    /// For every request: the host relies on the non-root / 256-process floor
+    /// and the limit read-back, so it never sends a Docker run to a module
+    /// that does not advertise the capability.
+    Always,
+}
+
+/// Whether `request` may be sent to a module with `capabilities`: always for
+/// requests that leave `user` and `pids_limit` unset, otherwise only when the
+/// module advertises [`HARDENED_DOCKER_RUN_FEATURE`]. Equivalent to
+/// [`docker_run_request_is_supported_with_policy`] with
+/// [`HardenedDockerRunPolicy::WhenRequested`]; a host that requires the floor
+/// for every run uses [`HardenedDockerRunPolicy::Always`] instead.
+#[must_use]
+pub fn docker_run_request_is_supported(
+    capabilities: &ModuleCapabilities,
+    request: &DockerRunRequest,
+) -> bool {
+    docker_run_request_is_supported_with_policy(
+        capabilities,
+        request,
+        HardenedDockerRunPolicy::WhenRequested,
+    )
+}
+
+/// Whether `request` may be sent to a module with `capabilities` under the
+/// host's `policy`. With [`HardenedDockerRunPolicy::Always`] the capability is
+/// required for plain requests too, because a module without it would run
+/// them without the enforced floor and without `observed_limits`.
+#[must_use]
+pub fn docker_run_request_is_supported_with_policy(
+    capabilities: &ModuleCapabilities,
+    request: &DockerRunRequest,
+    policy: HardenedDockerRunPolicy,
+) -> bool {
+    let required = match policy {
+        HardenedDockerRunPolicy::WhenRequested => request.requests_hardened_limits(),
+        HardenedDockerRunPolicy::Always => true,
+    };
+    !required || supports_hardened_docker_run(capabilities)
 }
 
 /// Whether this host vocabulary can bind to a module's advertised version.
@@ -343,6 +439,14 @@ pub const INVALID_DOCKER_RUN: &str = "ai.tinyhumans.tinybox.Error.InvalidDockerR
 pub const INVALID_DOCKER_CONTROL: &str = "ai.tinyhumans.tinybox.Error.InvalidDockerControl";
 /// Stable error name for failed Docker lifecycle operations.
 pub const DOCKER_CONTROL_FAILED: &str = "ai.tinyhumans.tinybox.Error.DockerControlFailed";
+/// Stable error name when a Docker run is refused because the daemon reports
+/// (through the `docker info` enforcement probe) that it cannot enforce the
+/// process cap or memory limit. Nothing was created or started. Distinct from
+/// [`INVALID_DOCKER_RUN`], which also covers probes, creates or read-backs that
+/// failed or exceeded the deadline. Fork extension carried inside contract
+/// 2.3; see [`HARDENED_DOCKER_RUN_FEATURE`].
+pub const DOCKER_LIMITS_UNENFORCEABLE: &str =
+    "ai.tinyhumans.tinybox.Error.DockerLimitsUnenforceable";
 
 /// Opaque module-minted reservation identifier bound by one module instance.
 /// IDs use ASCII letters, digits, hyphens, or underscores, up to [`MAX_ID_BYTES`].
@@ -365,7 +469,13 @@ pub enum ReserveRequest {
 }
 
 /// Backend operations with acknowledged native ownership in this module build.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `features` is a public-field addition in this fork: downstream code that
+/// builds this struct with a literal must name the new field or end the
+/// literal with `..Default::default()`. [`Default`] is the empty description:
+/// contract version `(0, 0)` (compatible with nothing), no backends and no
+/// features, so a defaulted field never claims a capability.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ModuleCapabilities {
     /// Wire vocabulary served by the artifact, independent of package version.
     pub contract_version: (u32, u32),
@@ -375,6 +485,11 @@ pub struct ModuleCapabilities {
     pub exec_backends: Vec<String>,
     /// Backends accepted by supervised Spawn/Cancel.
     pub spawn_backends: Vec<String>,
+    /// Named fork capabilities this module build enforces, such as
+    /// [`HARDENED_DOCKER_RUN_FEATURE`]. Older modules omit it, which reads as
+    /// empty; it is omitted from the wire when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub features: Vec<String>,
 }
 
 /// A workspace supplied to a backend; unsupported sources are refused.
@@ -517,6 +632,7 @@ pub struct DockerRunRequest {
     #[serde(default)]
     pub network: Option<String>,
     /// Memory limit in MiB, or `None` for the existing one-shot default.
+    /// `0` (which Docker reads as unlimited) is refused with `InvalidDockerRun`.
     #[serde(default)]
     pub memory_limit_mb: Option<u64>,
     /// CPU quota in cores, or `None` for the existing one-shot default.
@@ -532,7 +648,9 @@ pub struct DockerRunRequest {
     /// Additional Linux capabilities to drop.
     #[serde(default)]
     pub extra_cap_drops: Vec<String>,
-    /// Environment variables passed to the command.
+    /// Environment variables passed to the command. Their values are
+    /// delivered to the container only; they never appear on a Docker
+    /// command line.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     /// Optional Docker label for the owned container.
@@ -541,6 +659,46 @@ pub struct DockerRunRequest {
     /// Maximum command runtime in milliseconds.
     #[serde(default = "default_docker_run_timeout_ms")]
     pub timeout_ms: u64,
+    /// Numeric non-root `uid:gid` the command runs as (`--user`); uid 0,
+    /// gid 0 and names are refused. `None` keeps the module's non-root default
+    /// (the workspace owner, else `65534:65534`). A module advertising
+    /// [`HARDENED_DOCKER_RUN_FEATURE`] probes enforcement and reads the
+    /// effective limits back before EVERY run, whether or not this is set,
+    /// refuses to start one whose limits are not in force, and reports them in
+    /// [`DockerRunOutput::observed_limits`]. Only send it to such a module: an
+    /// older module ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// Maximum number of processes in the container (`--pids-limit`); must be
+    /// between 1 and 256, so it can tighten but never loosen the module's
+    /// mandatory 256-process cap. `None` keeps 256. See `user` for the
+    /// probe and read-back every run gets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pids_limit: Option<u64>,
+}
+
+impl DockerRunRequest {
+    /// Whether this request sets `user` or `pids_limit`, which only a module
+    /// advertising [`HARDENED_DOCKER_RUN_FEATURE`] enforces. Check
+    /// [`docker_run_request_is_supported`] (or
+    /// [`docker_run_request_is_supported_with_policy`] when the host requires
+    /// the floor for every run) before sending it.
+    #[must_use]
+    pub fn requests_hardened_limits(&self) -> bool {
+        self.user.is_some() || self.pids_limit.is_some()
+    }
+}
+
+/// Container limits the module read back with `docker inspect` before the
+/// command started.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DockerObservedLimits {
+    /// `HostConfig.Memory`, in bytes.
+    pub memory_bytes: u64,
+    /// `HostConfig.PidsLimit`; `None` when unset or unlimited.
+    pub pids_limit: Option<i64>,
+    /// `Config.User`; empty when the image default applies.
+    pub user: String,
 }
 
 /// Bounded result from one Docker command.
@@ -554,6 +712,14 @@ pub struct DockerRunOutput {
     pub stderr: String,
     /// Whether the command exceeded its deadline; this alone does not prove a stop.
     pub timed_out: bool,
+    /// The effective limits read back before the command started (the
+    /// request's values, or the module defaults for the ones it left unset).
+    /// A module advertising [`HARDENED_DOCKER_RUN_FEATURE`] reports them for
+    /// every run, with or without `user` / `pids_limit`. `None` means the
+    /// module did not verify them (an older module), so a host must treat the
+    /// limits as unverified. Fork extension carried inside contract 2.3.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_limits: Option<DockerObservedLimits>,
     /// Whether Docker confirmed targeted timeout cleanup. Older modules omit it.
     /// Fork extension carried inside contract 2.3; optional and additive.
     #[serde(default)]
