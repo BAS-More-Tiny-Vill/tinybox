@@ -539,7 +539,7 @@ fn hardened_docker_run_is_advertised_as_a_capability_not_a_version() -> Result<(
 {
     assert_eq!(HARDENED_DOCKER_RUN_FEATURE, "docker-run-hardened-v1");
     let old = old_module_capabilities()?;
-    assert!(old.features.is_empty());
+    assert_eq!(old.features, [] as [std::string::String; 0]);
     // The version check alone cannot tell the two modules apart.
     assert!(is_compatible(old.contract_version));
     assert!(!supports_hardened_docker_run(&old));
@@ -657,8 +657,8 @@ fn module_capabilities_default_supports_struct_update_syntax() -> Result<(), ser
         create_backends: vec!["passthrough".into()],
         ..Default::default()
     };
-    assert!(capabilities.features.is_empty());
-    assert!(capabilities.exec_backends.is_empty());
+    assert_eq!(capabilities.features, [] as [std::string::String; 0]);
+    assert_eq!(capabilities.exec_backends, [] as [std::string::String; 0]);
     assert!(!supports_hardened_docker_run(&capabilities));
     // The default claims no contract version and no capability.
     let empty = ModuleCapabilities::default();

@@ -1048,7 +1048,7 @@ create)
     -m) m=${{a%m}};;
     --pids-limit) p=$a;;
     --user) u=$a;;
-    --env-file) cat \"$a\" > '{d}/env-file'; stat -c %a \"$a\" > '{d}/env-file.mode';;
+    --env-file) cat \"$a\" > '{d}/env-file'; (stat -c %a \"$a\" 2>/dev/null || stat -f %Lp \"$a\") > '{d}/env-file.mode';;
     esac
     prev=$a
   done
