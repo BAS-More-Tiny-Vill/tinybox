@@ -4,13 +4,18 @@
 //! open and `docker exec`s into it. Some callers want the opposite contract:
 //! every command gets a **fresh** container, nothing persists between commands,
 //! and the container removes itself when the command exits. That is what this
-//! module provides, and it deliberately reproduces one exact command line — the
-//! flags below, in this order — because callers pin it.
+//! module provides. Its command line retains explicit resource and mount policy,
+//! with a mandatory non-root identity and process-count limit. A caller may
+//! choose another non-root identity or a tighter process cap, never root or a
+//! looser cap, and [`DockerCli::run_one_shot_verified`] reads the effective
+//! limits back before the command starts.
 //!
 //! The command line is built by [`OneShot::argv`], a pure function (apart from
 //! resolving symlinks in mount paths), so it can be tested without a daemon.
 //! [`DockerCli`] runs it, probes the daemon, and kills labelled stragglers; its
 //! program name is injectable so tests can substitute a fake binary.
+
+mod execution;
 
 use std::ffi::{OsStr, OsString};
 use std::io;
@@ -37,6 +42,10 @@ pub const DEFAULT_ONE_SHOT_CPUS: f64 = 1.0;
 
 /// How many bytes of stdout or stderr a [`OneShotOutcome`] keeps (1 MiB).
 pub const MAX_OUTPUT_BYTES: usize = 1_048_576;
+
+/// The process cap every one-shot container runs with. A caller may tighten it
+/// with [`OneShot::with_pids_limit`], never loosen it.
+pub const MAX_ONE_SHOT_PIDS_LIMIT: u64 = 256;
 
 /// The `docker inspect --format` template that reads a container's limits
 /// back: memory in bytes, the pids limit, and the configured user.
@@ -143,33 +152,48 @@ impl OneShot {
         }
     }
 
-    /// Run the command as numeric `uid:gid` (`--user`) instead of the image's
-    /// default user, which for most images is root.
+    /// Run the command as numeric `uid:gid` (`--user`) instead of the default
+    /// non-root workspace owner (or `65534:65534`). A root uid is never
+    /// honoured: `uid` 0 keeps that non-root default.
     #[must_use]
     pub fn with_user(mut self, uid: u32, gid: u32) -> Self {
-        self.user = Some(format!("{uid}:{gid}"));
+        self.user = (uid != 0).then(|| format!("{uid}:{gid}"));
         self
     }
 
-    /// Cap the number of processes in the container (`--pids-limit`), so a
-    /// fork bomb exhausts the container's budget rather than the host's
-    /// process table. The memory limit does not contain one.
+    /// Tighten the process cap (`--pids-limit`) below the mandatory
+    /// [`MAX_ONE_SHOT_PIDS_LIMIT`]. The value is clamped to
+    /// `1..=MAX_ONE_SHOT_PIDS_LIMIT`, so it can never loosen the cap.
     #[must_use]
     pub fn with_pids_limit(mut self, pids_limit: u64) -> Self {
         self.pids_limit = Some(pids_limit);
         self
     }
 
+    /// The `--user` the container runs as: the caller's non-root identity, or
+    /// the non-root workspace owner, or `65534:65534`.
+    fn effective_user(&self) -> String {
+        self.user.clone().unwrap_or_else(|| {
+            sandbox_user_for(self.mount_workspace.then_some(self.workspace.as_path()))
+        })
+    }
+
+    /// The `--pids-limit` the container runs with; never above the mandatory cap.
+    fn effective_pids_limit(&self) -> u64 {
+        self.pids_limit.map_or(MAX_ONE_SHOT_PIDS_LIMIT, |n| {
+            n.clamp(1, MAX_ONE_SHOT_PIDS_LIMIT)
+        })
+    }
+
     /// The limits Docker should report for a container started from this
-    /// spec, in the shape [`ObservedLimits::parse`] returns.
+    /// spec, in the shape [`ObservedLimits::parse`] returns. These are the
+    /// effective values, whether the caller supplied them or they defaulted.
     #[must_use]
     pub fn expected_limits(&self) -> ObservedLimits {
         ObservedLimits {
             memory_bytes: self.memory_mb.saturating_mul(1024 * 1024),
-            pids_limit: self
-                .pids_limit
-                .map(|n| i64::try_from(n).unwrap_or(i64::MAX)),
-            user: self.user.clone().unwrap_or_default(),
+            pids_limit: Some(i64::try_from(self.effective_pids_limit()).unwrap_or(i64::MAX)),
+            user: self.effective_user(),
         }
     }
 
@@ -278,19 +302,16 @@ impl OneShot {
             push("--cap-drop");
             push(cap);
         }
+        // Mandatory: a non-root identity and a process cap on every run. A
+        // caller-supplied user or pids limit replaces only the default value.
+        push("--user");
+        push(&self.effective_user());
+        push("--pids-limit");
+        push(&self.effective_pids_limit().to_string());
         push("-m");
         push(&format!("{}m", self.memory_mb));
         push("--cpus");
         push(&self.cpus.to_string());
-        // Opt-in, so callers that pin the default command line see no change.
-        if let Some(pids_limit) = self.pids_limit {
-            push("--pids-limit");
-            push(&pids_limit.to_string());
-        }
-        if let Some(user) = &self.user {
-            push("--user");
-            push(user);
-        }
         if self.read_only_rootfs {
             push("--read-only");
             push("--tmpfs");
@@ -317,7 +338,7 @@ impl OneShot {
         }
 
         // Names only: the values reach the docker client through its own
-        // environment (see `run_one_shot`), so they never sit on an argv that
+        // environment (see `execution::run`), so they never sit on an argv that
         // any local user can read from the process table.
         for (key, _) in &self.env {
             argv.push(OsString::from("-e"));
@@ -333,6 +354,22 @@ impl OneShot {
         push(&self.command);
         argv
     }
+}
+
+/// Use the non-root workspace owner; never inherit a root identity.
+fn sandbox_user_for(workspace: Option<&Path>) -> String {
+    #[cfg(unix)]
+    if let Some(workspace) = workspace {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(metadata) = workspace.metadata()
+            && metadata.uid() != 0
+        {
+            return format!("{}:{}", metadata.uid(), metadata.gid());
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = workspace;
+    "65534:65534".to_owned()
 }
 
 fn resolve(path: &Path) -> PathBuf {
@@ -352,6 +389,11 @@ pub struct OneShotOutcome {
     pub stderr: String,
     /// Whether the run exceeded its deadline.
     pub timed_out: bool,
+    /// Whether targeted timeout cleanup confirmed the workload stopped.
+    /// `None` means no timeout occurred; `Some(false)` must never imply a kill.
+    pub killed: Option<bool>,
+    /// Observed elapsed time, including bounded timeout cleanup.
+    pub duration_ms: u64,
 }
 
 /// A handle on the local `docker` command-line client.
@@ -396,45 +438,37 @@ impl DockerCli {
         result.is_ok_and(|output| output.status.success())
     }
 
-    /// Run `spec` in a fresh container and wait for it, up to `timeout`.
+    /// Run a fresh, non-root container with a process cap and a unique name.
     ///
-    /// A command that exits non-zero is a success here, reported in
-    /// [`OneShotOutcome::exit_code`]. Hitting the deadline is also an outcome
-    /// ([`OneShotOutcome::timed_out`]): the local client is killed, and so is the
-    /// container, found by a label unique to this run (killing an attached
-    /// `docker run` does not stop its container).
+    /// The run is supervised through its deadline even if the caller drops its
+    /// wait. Timeout cleanup kills only this container, retries with forced
+    /// removal, and reports whether Docker confirmed the stop. Output is drained
+    /// with bounded memory; cleanup commands have their own short deadlines.
     ///
     /// # Errors
     ///
-    /// Returns the I/O error when the `docker` client cannot be started.
+    /// Returns an I/O error when the client cannot start or output cannot be read.
     pub async fn run_one_shot(
         &self,
         spec: &OneShot,
         timeout: Duration,
     ) -> io::Result<OneShotOutcome> {
-        // Per run, not `spec.label`: callers share one label across concurrent runs.
-        let run_label = format!("ai.tinyhumans.tinybox.oneshot={}", uuid::Uuid::new_v4());
-        let mut argv = spec.argv();
-        argv.splice(
-            2..2,
-            [OsString::from("--label"), OsString::from(&run_label)],
-        );
-        let mut cmd = Command::new(&self.program);
-        cmd.args(argv);
-        cmd.envs(spec.env.iter().map(|(key, value)| (key, value)));
-        self.wait_attached(cmd, timeout, &run_label).await
+        tokio::spawn(execution::run(self.clone(), spec.clone(), timeout))
+            .await
+            .map_err(io::Error::other)?
     }
 
     /// Like [`Self::run_one_shot`], but reads the container's limits back
     /// before the command runs, and refuses to run it when they are not the
-    /// ones `spec` asked for.
+    /// effective ones [`OneShot::expected_limits`] describes.
     ///
-    /// The container is `docker create`d (same flags, same per-run label),
-    /// `docker inspect`ed with [`OBSERVED_LIMITS_FORMAT`], compared with
-    /// [`OneShot::expected_limits`], and only then `docker start -a`ed. A
-    /// mismatch, or inspect output that cannot be read, removes the created
-    /// container and returns an error; the command never starts. `timeout`
-    /// covers all of these steps.
+    /// The container is `docker create`d (same flags, same unique
+    /// `tinybox-<uuid>` name), `docker inspect`ed with
+    /// [`OBSERVED_LIMITS_FORMAT`], compared, and only then `docker start -a`ed
+    /// under the same supervision, bounded draining and targeted timeout
+    /// cleanup as [`Self::run_one_shot`]. A mismatch, or inspect output that
+    /// cannot be read, removes the created container and returns an error; the
+    /// command never starts. `timeout` covers all of these steps.
     ///
     /// # Errors
     ///
@@ -446,154 +480,9 @@ impl DockerCli {
         spec: &OneShot,
         timeout: Duration,
     ) -> io::Result<VerifiedOneShot> {
-        let deadline = tokio::time::Instant::now() + timeout;
-        let run_label = format!("ai.tinyhumans.tinybox.oneshot={}", uuid::Uuid::new_v4());
-        let mut argv = spec.argv();
-        argv[0] = OsString::from("create");
-        argv.splice(
-            2..2,
-            [OsString::from("--label"), OsString::from(&run_label)],
-        );
-        let mut create = Command::new(&self.program);
-        create.args(argv);
-        create.envs(spec.env.iter().map(|(key, value)| (key, value)));
-        let created = self
-            .bounded_output(create, deadline, "docker create")
-            .await?;
-        if !created.status.success() {
-            return Err(io::Error::other(format!(
-                "docker create failed: {}",
-                first_line(&created.stderr)
-            )));
-        }
-        let id = String::from_utf8_lossy(&created.stdout).trim().to_owned();
-        if id.is_empty() || id.contains(char::is_whitespace) {
-            return Err(io::Error::other("docker create returned no container id"));
-        }
-
-        let observed = match self.read_back(&id, deadline).await {
-            Ok(observed) => observed,
-            Err(e) => {
-                self.remove(&id).await;
-                return Err(e);
-            }
-        };
-        let expected = spec.expected_limits();
-        if observed != expected {
-            self.remove(&id).await;
-            return Err(io::Error::other(format!(
-                "container limits are not in force: expected {expected:?}, observed {observed:?}"
-            )));
-        }
-
-        let mut start = Command::new(&self.program);
-        start.args(["start", "-a", &id]);
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let outcome = self.wait_attached(start, remaining, &run_label).await?;
-        Ok(VerifiedOneShot { outcome, observed })
-    }
-
-    async fn read_back(
-        &self,
-        id: &str,
-        deadline: tokio::time::Instant,
-    ) -> io::Result<ObservedLimits> {
-        let mut inspect = Command::new(&self.program);
-        inspect.args(["inspect", "--format", OBSERVED_LIMITS_FORMAT, id]);
-        let out = self
-            .bounded_output(inspect, deadline, "docker inspect")
-            .await?;
-        if !out.status.success() {
-            return Err(io::Error::other(format!(
-                "docker inspect failed: {}",
-                first_line(&out.stderr)
-            )));
-        }
-        let text = String::from_utf8_lossy(&out.stdout);
-        ObservedLimits::parse(&text).ok_or_else(|| {
-            io::Error::other(format!(
-                "docker inspect output is not a limit line: {:?}",
-                first_line(&out.stdout)
-            ))
-        })
-    }
-
-    async fn bounded_output(
-        &self,
-        mut cmd: Command,
-        deadline: tokio::time::Instant,
-        what: &str,
-    ) -> io::Result<std::process::Output> {
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
-        cmd.kill_on_drop(true);
-        tokio::time::timeout_at(deadline, cmd.output())
+        tokio::spawn(execution::run_verified(self.clone(), spec.clone(), timeout))
             .await
-            .map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!("{what} exceeded its deadline"),
-                )
-            })?
-    }
-
-    /// Best effort: force-remove a created container that must not run.
-    async fn remove(&self, id: &str) {
-        let _ = tokio::time::timeout(
-            Duration::from_secs(10),
-            Command::new(&self.program)
-                .args(["rm", "-f", id])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .kill_on_drop(true)
-                .status(),
-        )
-        .await;
-    }
-
-    /// Run an attached client (`run` or `start -a`) to completion or `timeout`,
-    /// killing the container by `run_label` on a timeout.
-    async fn wait_attached(
-        &self,
-        mut cmd: Command,
-        timeout: Duration,
-        run_label: &str,
-    ) -> io::Result<OneShotOutcome> {
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
-        cmd.kill_on_drop(true);
-
-        match tokio::time::timeout(timeout, cmd.output()).await {
-            Ok(Ok(output)) => {
-                let mut stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                let mut stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                cap(&mut stdout, "\n... [output truncated at 1MB]");
-                cap(&mut stderr, "\n... [stderr truncated at 1MB]");
-                Ok(OneShotOutcome {
-                    exit_code: output.status.code().unwrap_or(-1),
-                    stdout,
-                    stderr,
-                    timed_out: false,
-                })
-            }
-            Ok(Err(e)) => Err(e),
-            Err(_) => {
-                // ponytail: `ps -q` misses a container created but not yet
-                // started; `ps -aq` + `rm -f` if that window matters.
-                let _ =
-                    tokio::time::timeout(Duration::from_secs(10), self.kill_labelled(run_label))
-                        .await;
-                Ok(OneShotOutcome {
-                    exit_code: -1,
-                    stdout: String::new(),
-                    stderr: format!(
-                        "Command timed out after {}s and was killed",
-                        timeout.as_secs()
-                    ),
-                    timed_out: true,
-                })
-            }
-        }
+            .map_err(io::Error::other)?
     }
 
     /// Kill every running container carrying `label` (`key=value`), returning

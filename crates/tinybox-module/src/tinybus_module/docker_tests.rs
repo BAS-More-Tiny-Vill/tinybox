@@ -346,6 +346,8 @@ async fn run_docker_preserves_one_shot_settings_output_and_timeout()
     assert_eq!(output.stdout, "out");
     assert_eq!(output.stderr, "err");
     assert!(!output.timed_out);
+    assert_eq!(output.killed, None);
+    assert!(output.duration_ms.is_some());
 
     let argv: Vec<String> = std::fs::read(&argv_file)?
         .split(|byte| *byte == 0)
@@ -408,6 +410,8 @@ async fn run_without_workspace_preserves_docker_settings_without_host_mounts()
     assert_eq!(output.stdout, "out");
     assert_eq!(output.stderr, "err");
     assert!(!output.timed_out);
+    assert_eq!(output.killed, None);
+    assert!(output.duration_ms.is_some());
 
     let argv: Vec<String> = std::fs::read(&argv_file)?
         .split(|byte| *byte == 0)
@@ -664,4 +668,71 @@ fn def32_user_must_be_numeric_uid_gid_and_pids_limit_positive() {
         );
     }
     assert!(with(None, Some(0)).is_err());
+}
+
+#[test]
+fn merge_explicit_user_stays_non_root_and_pids_limit_cannot_loosen_the_cap() {
+    let with = |user: Option<&str>, pids: Option<u64>| {
+        let mut request = policy_request(None, &[], "/work");
+        request.user = user.map(str::to_owned);
+        request.pids_limit = pids;
+        validate(&request, true)
+    };
+    for root in ["0:0", "0:1000", "00:1000"] {
+        assert!(
+            matches!(with(Some(root), None), Err(e) if e.wire_name() == tinybox_bus::INVALID_DOCKER_RUN),
+            "{root}"
+        );
+    }
+    assert!(with(None, Some(1)).is_ok());
+    assert!(with(None, Some(tinybox_docker::MAX_ONE_SHOT_PIDS_LIMIT)).is_ok());
+    for loose in [tinybox_docker::MAX_ONE_SHOT_PIDS_LIMIT + 1, u64::MAX] {
+        assert!(
+            matches!(with(None, Some(loose)), Err(e) if e.wire_name() == tinybox_bus::INVALID_DOCKER_RUN),
+            "{loose}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn merge_an_explicit_pids_limit_alone_reads_back_the_default_user()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace)?;
+    let user = {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(&workspace)?;
+        if metadata.uid() == 0 {
+            "65534:65534".to_owned()
+        } else {
+            format!("{}:{}", metadata.uid(), metadata.gid())
+        }
+    };
+    let (cli, argv_file, calls) = verified_cli(temp.path(), &format!("536870912 64 {user}"))?;
+    let mut request = policy_request(None, &[], &workspace.display().to_string());
+    request.pids_limit = Some(64);
+    request.timeout_ms = 20_000;
+    let output = run_with_cli(&cli, request, true).await?;
+    assert_eq!(
+        output.observed_limits,
+        Some(tinybox_bus::DockerObservedLimits {
+            memory_bytes: 536_870_912,
+            pids_limit: Some(64),
+            user: user.clone(),
+        })
+    );
+    assert_eq!(output.killed, None);
+    assert!(output.duration_ms.is_some());
+    let argv: Vec<String> = std::fs::read(&argv_file)?
+        .split(|byte| *byte == 0)
+        .filter(|part| !part.is_empty())
+        .map(|part| String::from_utf8_lossy(part).into_owned())
+        .collect();
+    assert_eq!(argv[2], "--name", "{argv:?}");
+    assert!(argv[3].starts_with("tinybox-"), "{argv:?}");
+    assert!(has_pair(&argv, "--user", &user), "{argv:?}");
+    assert!(has_pair(&argv, "--pids-limit", "64"), "{argv:?}");
+    assert_eq!(std::fs::read_to_string(&calls)?, "create\ninspect\nstart\n");
+    Ok(())
 }

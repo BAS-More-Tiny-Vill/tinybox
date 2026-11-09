@@ -23,7 +23,7 @@ pub use jail::{JailEnforcement, NativeJailConfig, NativeJailRequest, NativeJailR
 
 mod shell_execution;
 mod shell_selection;
-pub use shell_execution::ShellExecRequest;
+pub use shell_execution::{RunNativeShellRequest, RunNativeShellResult, ShellExecRequest};
 pub use shell_selection::{SelectShellRequest, ShellFlavor, ShellInvocation};
 
 mod stdio;
@@ -39,7 +39,7 @@ mod policy;
 pub use policy::{DockerPolicyReport, DockerPolicyRequest};
 
 mod event;
-pub use event::{DenialKind, EgressAllowlist, LimitKind, SandboxEvent};
+pub use event::{DenialKind, EgressAllowlist, LimitKind, ProcessEvent, SandboxEvent};
 
 mod files;
 pub use files::{
@@ -83,8 +83,19 @@ pub use files::{
 /// `AnalyzeShell.hidden_execution` policy signal. Generic shell structure facts
 /// and transport helpers remain.
 /// 2.1 adds separate resource-aware native jail request members without
-/// changing the 2.0 Rust request shapes.
-pub const CONTRACT_VERSION: (u32, u32) = (2, 1);
+/// changing the 2.0 Rust request shapes. 2.2 adds process-scoped lifecycle
+/// events for module-owned executions and timeout observations. 2.3 adds
+/// module-owned native-shell orchestration through completion or yield, and
+/// the `openshell` sandbox backend for `Create`.
+///
+/// Fork extension carried inside 2.3: the optional [`DockerRunOutput`]
+/// `killed` and `duration_ms` evidence fields from this fork's Docker
+/// one-shot extension (docs/specs/contract-2-1.md; not upstream's 2.1). They
+/// are additive, default to `None` when a module omits them, and no contract
+/// version identifies them. The same holds for the optional
+/// [`DockerRunRequest`] `user` and `pids_limit` fields and
+/// [`DockerRunOutput`] `observed_limits` (DEF-32).
+pub const CONTRACT_VERSION: (u32, u32) = (2, 3);
 
 /// Minimum contract version required for resource-aware native jail members.
 pub const NATIVE_JAIL_RESOURCES_VERSION: (u32, u32) = (2, 1);
@@ -205,6 +216,8 @@ pub mod names {
     pub const START_SHELL_EXEC: &str = "StartShellExec";
     /// Wire name of the `StartNativeShellExec` member.
     pub const START_NATIVE_SHELL_EXEC: &str = "StartNativeShellExec";
+    /// Wire name of the module-owned native-shell lifecycle member.
+    pub const RUN_NATIVE_SHELL: &str = "RunNativeShell";
     /// Wire name of the `ValidateDockerPolicy` member.
     pub const VALIDATE_DOCKER_POLICY: &str = "ValidateDockerPolicy";
     /// Wire name of the `StartStdio` member.
@@ -221,7 +234,12 @@ pub mod names {
     pub const STDIO_STATUS: &str = "StdioStatus";
     /// Wire name of the 2.1 resource-aware jailed exec member.
     pub const START_JAILED_EXEC_WITH_RESOURCES: &str = "StartJailedExecWithResources";
+    /// Wire name of the process-scoped sandbox lifecycle signal.
+    pub const PROCESS_EVENT: &str = "ProcessEvent";
 }
+
+/// Supported signals in this contract.
+pub const SIGNALS: &[&str] = &[names::PROCESS_EVENT];
 
 /// Supported methods in this contract, including the original discovery
 /// operation. Derived from [`names`]; the order is stable within this major.
@@ -268,6 +286,7 @@ pub const METHODS: &[&str] = &[
     names::KILL_STDIO,
     names::STDIO_STATUS,
     names::START_JAILED_EXEC_WITH_RESOURCES,
+    names::RUN_NATIVE_SHELL,
 ];
 
 /// Facts about the detected native directory-jail backend.
@@ -524,15 +543,18 @@ pub struct DockerRunRequest {
     /// Maximum command runtime in milliseconds.
     #[serde(default = "default_docker_run_timeout_ms")]
     pub timeout_ms: u64,
-    /// Numeric `uid:gid` the command runs as (`--user`); `None` keeps the
-    /// image's default user. Setting this or `pids_limit` makes the module read
-    /// the container's limits back before the command starts, refuse to start
-    /// it when they are not in force, and report them in
+    /// Numeric non-root `uid:gid` the command runs as (`--user`); uid 0 and
+    /// names are refused. `None` keeps the module's non-root default (the
+    /// workspace owner, else `65534:65534`). Setting this or `pids_limit` makes
+    /// the module read the effective limits back before the command starts,
+    /// refuse to start it when they are not in force, and report them in
     /// [`DockerRunOutput::observed_limits`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
     /// Maximum number of processes in the container (`--pids-limit`); must be
-    /// positive. See `user` for the read-back it triggers.
+    /// between 1 and 256, so it can tighten but never loosen the module's
+    /// mandatory 256-process cap. `None` keeps 256. See `user` for the
+    /// read-back it triggers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pids_limit: Option<u64>,
 }
@@ -558,13 +580,23 @@ pub struct DockerRunOutput {
     pub stdout: String,
     /// Bounded, lossily decoded stderr.
     pub stderr: String,
-    /// Whether the module stopped the command after its deadline.
+    /// Whether the command exceeded its deadline; this alone does not prove a stop.
     pub timed_out: bool,
-    /// The limits read back before the command started; present only when the
-    /// request set `user` or `pids_limit`. A host that asked for them and gets
-    /// `None` is talking to a module that did not verify them.
+    /// The effective limits read back before the command started (the
+    /// request's values, or the module defaults for the ones it left unset);
+    /// present only when the request set `user` or `pids_limit`. A host that
+    /// asked for them and gets `None` is talking to a module that did not
+    /// verify them. Fork extension carried inside contract 2.3.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_limits: Option<DockerObservedLimits>,
+    /// Whether Docker confirmed targeted timeout cleanup. Older modules omit it.
+    /// Fork extension carried inside contract 2.3; optional and additive.
+    #[serde(default)]
+    pub killed: Option<bool>,
+    /// Observed elapsed milliseconds, including bounded cleanup; never a requested limit.
+    /// Fork extension carried inside contract 2.3; optional and additive.
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
 }
 
 /// Check whether the module's Docker daemon responds within a bounded interval.

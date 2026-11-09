@@ -31,8 +31,34 @@ jobs:
           }
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
-  module-release:
+  validate-source:
     needs: resolve
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ needs.resolve.outputs.tag }}
+          submodules: recursive
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249
+        with:
+          components: rustfmt, clippy, llvm-tools-preview
+      - uses: taiki-e/install-action@70b10d055da4af0e46b2f7166e710204993798b3
+        with:
+          tool: cargo-llvm-cov
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - run: cargo build --locked --workspace --all-targets --all-features
+      - run: cargo test --locked --workspace --all-features
+      - run: .github/scripts/check-file-coverage.sh 90 target/coverage.json
+      - run: cargo doc --locked --workspace --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+  module-release:
+    needs: [resolve, validate-source]
     permissions:
       contents: write
     uses: tinyhumansai/.github/.github/workflows/module-release.yml@4adc1080fb495098e7af1aade82ed7e6e3c69bb7

@@ -158,26 +158,33 @@ async fn run_with_cli(
             stderr: outcome.stderr,
             timed_out: outcome.timed_out,
             observed_limits: None,
+            killed: outcome.killed,
+            duration_ms: Some(outcome.duration_ms),
         });
     }
 
-    // DEF-32: a requested limit is not evidence that it is in force. Read it
-    // back before the command starts, and do not start it otherwise.
+    // DEF-32: a requested limit is not evidence that it is in force. Read the
+    // effective limits back (the caller's values, or the defaults for the
+    // ones it left unset) before the command starts, and do not start it
+    // otherwise.
     let verified = cli
         .run_one_shot_verified(&spec, timeout)
         .await
         .map_err(|error| failure(&format!("Docker limits could not be verified: {error}")))?;
     let observed = verified.observed;
+    let outcome = verified.outcome;
     Ok(DockerRunOutput {
-        exit_code: verified.outcome.exit_code,
-        stdout: verified.outcome.stdout,
-        stderr: verified.outcome.stderr,
-        timed_out: verified.outcome.timed_out,
+        exit_code: outcome.exit_code,
+        stdout: outcome.stdout,
+        stderr: outcome.stderr,
+        timed_out: outcome.timed_out,
         observed_limits: Some(tinybox_bus::DockerObservedLimits {
             memory_bytes: observed.memory_bytes,
             pids_limit: observed.pids_limit,
             user: observed.user,
         }),
+        killed: outcome.killed,
+        duration_ms: Some(outcome.duration_ms),
     })
 }
 
@@ -198,14 +205,18 @@ fn validate(request: &DockerRunRequest, mount_workspace: bool) -> Result<()> {
     {
         return Err(failure("Docker run request is invalid"));
     }
+    // The fork's non-root identity and process cap are the floor: a caller may
+    // pick another non-root identity or a tighter cap, never root or a looser cap.
     if request
         .user
         .as_deref()
-        .is_some_and(|user| parse_user(user).is_none())
-        || request.pids_limit == Some(0)
+        .is_some_and(|user| parse_user(user).is_none_or(|(uid, _)| uid == 0))
+        || request
+            .pids_limit
+            .is_some_and(|n| n == 0 || n > tinybox_docker::MAX_ONE_SHOT_PIDS_LIMIT)
     {
         return Err(failure(
-            "Docker run request is invalid: user must be numeric uid:gid and pids_limit positive",
+            "Docker run request is invalid: user must be a non-root numeric uid:gid and pids_limit between 1 and 256",
         ));
     }
     let issues = tinybox_docker::run_policy_issues(

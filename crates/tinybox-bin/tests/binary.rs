@@ -318,3 +318,91 @@ async fn a_legacy_template_conflict_does_not_overwrite_current_state()
     assert_eq!(templates.get(&name)?.as_str(), "snap-new");
     Ok(())
 }
+
+// Process-level exit-status, piping and default-location coverage carried
+// over from the former tinybox-cli binary tests. The fork repaired these to
+// run against a real temporary workspace instead of a fixed /tmp directory.
+
+#[test]
+fn the_command_exit_status_becomes_the_process_exit_status() -> io::Result<()> {
+    let state = TempDir::new()?;
+    let workspace = TempDir::new()?;
+    let workspace_path = workspace.path().display().to_string();
+
+    let executed = tinybox(
+        state.path(),
+        &["run", "--dir", &workspace_path, "sh", "-c", "exit 9"],
+    )?;
+
+    // A code that is not forwarded shows up here and nowhere else.
+    assert_eq!(executed.status.code(), Some(9), "{}", stderr(&executed));
+    Ok(())
+}
+
+#[test]
+fn output_survives_being_piped() -> io::Result<()> {
+    let state = TempDir::new()?;
+    let workspace = TempDir::new()?;
+    let workspace_path = workspace.path().display().to_string();
+
+    let executed = tinybox(
+        state.path(),
+        &["run", "--dir", &workspace_path, "sh", "-c", "echo piped"],
+    )?;
+
+    // Not a terminal, so stdout is block-buffered; this fails if `main` exits
+    // without flushing.
+    assert_eq!(stdout(&executed).trim(), "piped");
+    assert!(executed.status.success(), "{}", stderr(&executed));
+    Ok(())
+}
+
+#[test]
+fn a_tinybox_failure_is_distinguishable_from_a_command_failure() -> io::Result<()> {
+    let state = TempDir::new()?;
+    let workspace = TempDir::new()?;
+    let workspace_path = workspace.path().display().to_string();
+
+    let missing = tinybox(state.path(), &["exec", "box-9", "true"])?;
+    assert_eq!(missing.status.code(), Some(70));
+    assert!(stderr(&missing).contains("no box with id box-9"));
+
+    let failed = tinybox(
+        state.path(),
+        &["run", "--dir", &workspace_path, "sh", "-c", "exit 1"],
+    )?;
+    assert_eq!(failed.status.code(), Some(1), "{}", stderr(&failed));
+    Ok(())
+}
+
+#[test]
+fn the_default_store_location_is_used_when_none_is_given() -> io::Result<()> {
+    let state = TempDir::new()?;
+    let workspace = TempDir::new()?;
+    let workspace_path = workspace.path().display().to_string();
+
+    // No `--store`, so the path comes from the environment. Setting it on the
+    // child avoids mutating this process's own environment, which would need
+    // `unsafe` in Rust 2024.
+    let created = Command::new(env!("CARGO_BIN_EXE_tinybox"))
+        .env("TINYBOX_STATE_DIR", state.path())
+        .args(["create", "--dir", &workspace_path])
+        .output()?;
+    assert!(created.status.success(), "{}", stderr(&created));
+    assert_eq!(stdout(&created).trim(), "box-0");
+
+    // Storage v2 keeps documents beside the default path rather than writing
+    // the legacy JSON file, so prove the location through a second process
+    // and through the equivalent explicit `--store` path.
+    assert!(!state.path().join("boxes.json").exists());
+    let listed = Command::new(env!("CARGO_BIN_EXE_tinybox"))
+        .env("TINYBOX_STATE_DIR", state.path())
+        .arg("ls")
+        .output()?;
+    assert!(listed.status.success(), "{}", stderr(&listed));
+    assert!(stdout(&listed).contains("box-0"));
+    let explicit = tinybox(state.path(), &["ls"])?;
+    assert!(explicit.status.success(), "{}", stderr(&explicit));
+    assert!(stdout(&explicit).contains("box-0"));
+    Ok(())
+}

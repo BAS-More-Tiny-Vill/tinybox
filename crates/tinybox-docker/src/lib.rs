@@ -41,8 +41,9 @@ mod sandbox;
 
 pub use oneshot::{
     DEFAULT_ONE_SHOT_CPUS, DEFAULT_ONE_SHOT_IMAGE, DEFAULT_ONE_SHOT_MEMORY_MB,
-    DEFAULT_ONE_SHOT_NETWORK, DockerCli, MAX_OUTPUT_BYTES, OBSERVED_LIMITS_FORMAT,
-    ONE_SHOT_WORKSPACE, ObservedLimits, OneShot, OneShotOutcome, VerifiedOneShot,
+    DEFAULT_ONE_SHOT_NETWORK, DockerCli, MAX_ONE_SHOT_PIDS_LIMIT, MAX_OUTPUT_BYTES,
+    OBSERVED_LIMITS_FORMAT, ONE_SHOT_WORKSPACE, ObservedLimits, OneShot, OneShotOutcome,
+    VerifiedOneShot,
 };
 
 pub use policy::{DANGEROUS_MOUNTS, HOST_NETWORK, run_policy_issues};

@@ -47,7 +47,7 @@ fn fake(dir: &Path, body: &str) -> (DockerCli, PathBuf) {
 /// Another test thread may `fork` while our write handle is still open, and the
 /// child keeps that handle until it `exec`s; executing the script in that window
 /// fails with `ETXTBSY`. Probe (a no-op for the script) until the window closes.
-fn wait_until_executable(path: &Path) {
+pub(super) fn wait_until_executable(path: &Path) {
     for _ in 0..200 {
         match std::process::Command::new(path)
             .arg("--tinybox-probe")
@@ -106,6 +106,19 @@ fn defaults_produce_the_pinned_command_line() {
         "-c",
         "echo hi && ls",
     ]));
+    let index = expected
+        .iter()
+        .position(|argument| argument == "-m")
+        .unwrap();
+    expected.splice(
+        index..index,
+        [
+            "--user".to_owned(),
+            sandbox_user_for(Some(tmp.path())),
+            "--pids-limit".to_owned(),
+            "256".to_owned(),
+        ],
+    );
     assert_eq!(strings(&spec.argv()), expected);
 }
 
@@ -126,6 +139,7 @@ fn without_workspace_preserves_isolation_flags_without_mount_or_workdir() {
     assert!(has_pair(&argv, "-m", "2048m"));
     assert!(has_pair(&argv, "--cpus", "2.5"));
     assert!(has_pair(&argv, "-e", "MODE"));
+    assert!(!argv.iter().any(|arg| arg.contains("host-cwd")));
     assert!(!argv.iter().any(|arg| arg == "-v"));
     assert!(!argv.iter().any(|arg| arg == "-w"));
     assert!(!argv.iter().any(|arg| arg == "--read-only"));
@@ -194,6 +208,19 @@ fn overrides_mounts_and_env_are_ordered() {
         "-c",
         "make test",
     ]));
+    let index = expected
+        .iter()
+        .position(|argument| argument == "-m")
+        .unwrap();
+    expected.splice(
+        index..index,
+        [
+            "--user".to_owned(),
+            sandbox_user_for(Some(tmp.path())),
+            "--pids-limit".to_owned(),
+            "256".to_owned(),
+        ],
+    );
     assert_eq!(strings(&spec.argv()), expected);
 }
 
@@ -219,21 +246,25 @@ async fn run_reports_exit_code_and_streams() {
             exit_code: 3,
             stdout: "out\n".into(),
             stderr: "err\n".into(),
-            timed_out: false
+            timed_out: false,
+            killed: None,
+            duration_ms: got.duration_ms,
         }
     );
-    // The run carries its own label right after `run --rm`.
-    let mut got = recorded(&out);
-    let run_label: Vec<String> = got.drain(2..4).collect();
-    assert_eq!(run_label[0], "--label");
-    assert!(run_label[1].starts_with("ai.tinyhumans.tinybox.oneshot="));
-    assert_eq!(got, strings(&spec.argv()));
+    let mut args = recorded(&out);
+    assert_eq!(args[2], "--name");
+    assert!(args[3].starts_with("tinybox-"));
+    args.drain(2..4);
+    assert_eq!(args, strings(&spec.argv()));
 }
 
 #[tokio::test]
 async fn run_times_out_with_the_pinned_message() {
     let tmp = tempfile::tempdir().unwrap();
-    let (cli, _) = fake(tmp.path(), "[ \"$1\" = run ] && exec sleep 5");
+    let (cli, _) = fake(
+        tmp.path(),
+        "if [ \"$1\" = kill ]; then exit 0; fi; exec sleep 5",
+    );
     let got = cli
         .run_one_shot(&OneShot::new(tmp.path(), "x"), Duration::from_millis(300))
         .await
@@ -241,7 +272,10 @@ async fn run_times_out_with_the_pinned_message() {
     assert!(got.timed_out);
     assert_eq!(got.exit_code, -1);
     assert_eq!(got.stdout.len(), 0);
-    assert_eq!(got.stderr, "Command timed out after 0s and was killed");
+    assert_eq!(
+        got.stderr,
+        "Command timed out after 0s and the container was killed"
+    );
 }
 
 #[tokio::test]
@@ -356,21 +390,20 @@ fn an_image_that_looks_like_a_flag_stays_a_positional() {
 #[tokio::test]
 async fn audit_h6_a_timed_out_run_kills_its_client_and_its_container() {
     let tmp = tempfile::tempdir().unwrap();
-    let (pid, label, calls) = (
+    let (pid, name, calls) = (
         tmp.path().join("pid"),
-        tmp.path().join("label"),
+        tmp.path().join("name"),
         tmp.path().join("calls"),
     );
     let (cli, _) = fake(
         tmp.path(),
         &format!(
             "case \"$1\" in\n\
-             run) echo $$ > '{pid}'; echo \"$4\" > '{label}'; exec sleep 30;;\n\
-             ps) echo \"$*\" >> '{calls}'; echo cid1;;\n\
+             run) echo $$ > '{pid}'; echo \"$4\" > '{name}'; exec sleep 30;;\n\
              kill) echo \"$*\" >> '{calls}';;\n\
              esac",
             pid = pid.display(),
-            label = label.display(),
+            name = name.display(),
             calls = calls.display(),
         ),
     );
@@ -379,16 +412,15 @@ async fn audit_h6_a_timed_out_run_kills_its_client_and_its_container() {
         .await
         .unwrap();
     assert!(got.timed_out);
+    assert_eq!(got.killed, Some(true));
 
-    let label = std::fs::read_to_string(&label).unwrap();
-    assert!(
-        label.starts_with("ai.tinyhumans.tinybox.oneshot="),
-        "{label}"
-    );
+    // The fork addresses only this invocation, by its unique container name.
+    let name = std::fs::read_to_string(&name).unwrap();
+    assert!(name.starts_with("tinybox-"), "{name}");
     assert_eq!(
         std::fs::read_to_string(&calls).unwrap_or_default(),
-        format!("ps -q --filter label={label}kill cid1\n"),
-        "the container must be killed by this run's own label"
+        format!("kill {name}"),
+        "the container must be killed by this run's own name"
     );
 
     let pid = std::fs::read_to_string(&pid).unwrap().trim().to_owned();
@@ -447,8 +479,10 @@ fn hardened(workspace: &Path) -> OneShot {
         .with_pids_limit(256)
 }
 
+// Merge with fork main: the fork's mandatory `--user`/`--pids-limit` slot
+// (before `-m`) is pinned, so an explicit value replaces the default in place.
 #[test]
-fn def32_user_and_pids_limit_follow_the_cpu_limit() {
+fn def32_explicit_user_and_pids_limit_take_the_mandatory_slot() {
     let tmp = tempfile::tempdir().unwrap();
     let mut expected = s(&[
         "run",
@@ -459,14 +493,14 @@ fn def32_user_and_pids_limit_follow_the_cpu_limit() {
         "none",
         "--cap-drop",
         "ALL",
+        "--user",
+        "1000:1000",
+        "--pids-limit",
+        "64",
         "-m",
         "512m",
         "--cpus",
         "1",
-        "--pids-limit",
-        "256",
-        "--user",
-        "1000:1000",
         "--read-only",
         "--tmpfs",
         "/tmp:rw,noexec,nosuid,size=64m",
@@ -486,17 +520,54 @@ fn def32_user_and_pids_limit_follow_the_cpu_limit() {
         "-c",
         "id -u",
     ]));
-    assert_eq!(strings(&hardened(tmp.path()).argv()), expected);
+    assert_eq!(
+        strings(&hardened(tmp.path()).with_pids_limit(64).argv()),
+        expected
+    );
 }
 
+// Merge with fork main: `--user` and `--pids-limit` are no longer opt-in; the
+// fork's non-root identity and 256-process cap are the defaults.
 #[test]
-fn def32_user_and_pids_limit_are_opt_in() {
+fn def32_user_and_pids_limit_default_to_the_fork_floor() {
     let tmp = tempfile::tempdir().unwrap();
     let argv = strings(&OneShot::new(tmp.path(), "true").argv());
     assert!(
-        !argv.iter().any(|a| a == "--user" || a == "--pids-limit"),
+        has_pair(&argv, "--user", &sandbox_user_for(Some(tmp.path()))),
         "{argv:?}"
     );
+    assert!(has_pair(&argv, "--pids-limit", "256"), "{argv:?}");
+}
+
+#[test]
+fn merge_a_root_user_is_never_honoured() {
+    let tmp = tempfile::tempdir().unwrap();
+    for (uid, gid) in [(0, 0), (0, 1000)] {
+        let argv = strings(&OneShot::new(tmp.path(), "true").with_user(uid, gid).argv());
+        assert!(
+            has_pair(&argv, "--user", &sandbox_user_for(Some(tmp.path()))),
+            "{argv:?}"
+        );
+    }
+    let argv = strings(&OneShot::new(tmp.path(), "true").with_user(1000, 0).argv());
+    assert!(has_pair(&argv, "--user", "1000:0"), "{argv:?}");
+}
+
+#[test]
+fn merge_pids_limit_may_tighten_but_never_loosen_the_cap() {
+    let tmp = tempfile::tempdir().unwrap();
+    for (asked, effective) in [(1, "1"), (64, "64"), (256, "256"), (257, "256"), (0, "1")] {
+        let argv = strings(
+            &OneShot::new(tmp.path(), "true")
+                .with_pids_limit(asked)
+                .argv(),
+        );
+        assert!(
+            has_pair(&argv, "--pids-limit", effective),
+            "{asked}: {argv:?}"
+        );
+    }
+    assert_eq!(MAX_ONE_SHOT_PIDS_LIMIT, 256);
 }
 
 #[test]
@@ -510,12 +581,13 @@ fn def32_expected_limits_describe_the_spec() {
             user: "1000:1000".into(),
         }
     );
+    // Merge with fork main: the defaults are the effective fork floor, not "unset".
     assert_eq!(
         OneShot::new(tmp.path(), "true").expected_limits(),
         ObservedLimits {
             memory_bytes: 512 * 1024 * 1024,
-            pids_limit: None,
-            user: String::new(),
+            pids_limit: Some(256),
+            user: sandbox_user_for(Some(tmp.path())),
         }
     );
 }
@@ -595,18 +667,21 @@ async fn def32_verified_run_creates_reads_back_then_starts() {
             stdout: "1000\n".into(),
             stderr: "warn\n".into(),
             timed_out: false,
+            killed: None,
+            duration_ms: got.outcome.duration_ms,
         }
     );
     assert_eq!(got.observed, spec.expected_limits());
 
     let log = calls(&log);
     assert_eq!(log.len(), 3, "{log:?}");
-    // `create` carries the run's own label, then exactly the spec's argv after `run`.
+    // Merge with fork main: `create` carries the run's unique `tinybox-<uuid>`
+    // name (not a per-run label), then exactly the spec's argv after `run`.
     let created: Vec<&str> = log[0].split(' ').collect();
     assert_eq!(created[0], "create");
     assert_eq!(created[1], "--rm");
-    assert_eq!(created[2], "--label");
-    assert!(created[3].starts_with("ai.tinyhumans.tinybox.oneshot="));
+    assert_eq!(created[2], "--name");
+    assert!(created[3].starts_with("tinybox-"));
     let tail: Vec<String> = strings(&spec.argv())[2..]
         .iter()
         .flat_map(|a| a.split(' ').map(str::to_owned).collect::<Vec<_>>())
@@ -659,8 +734,10 @@ async fn def32_verified_run_refuses_unreadable_inspect_output() {
     );
 }
 
+// Merge with fork main: timeout cleanup targets the run's unique name with
+// `kill` (then `rm -f`), never a label sweep through `ps --filter`.
 #[tokio::test]
-async fn def32_verified_run_times_out_and_kills_by_its_own_label() {
+async fn def32_verified_run_times_out_and_kills_by_its_own_name() {
     let tmp = tempfile::tempdir().unwrap();
     let (cli, log) = fake_verified(tmp.path(), "536870912 256 1000:1000", "exec sleep 5");
     let got = cli
@@ -669,11 +746,44 @@ async fn def32_verified_run_times_out_and_kills_by_its_own_label() {
         .unwrap();
     assert!(got.outcome.timed_out);
     assert_eq!(got.outcome.exit_code, -1);
+    assert_eq!(got.outcome.killed, Some(true));
     let log = calls(&log);
-    let label = log[0].split(' ').nth(3).unwrap().to_owned();
+    let name = log[0].split(' ').nth(3).unwrap().to_owned();
+    assert!(name.starts_with("tinybox-"), "{log:?}");
+    assert!(log.iter().any(|c| c == &format!("kill {name}")), "{log:?}");
+    assert!(!log.iter().any(|c| c.starts_with("ps ")), "{log:?}");
+}
+
+#[tokio::test]
+async fn merge_verified_run_checks_the_defaulted_floor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let user = sandbox_user_for(Some(tmp.path()));
+    let (cli, log) = fake_verified(tmp.path(), &format!("536870912 256 {user}"), "echo ok");
+    let spec = OneShot::new(tmp.path(), "true");
+    let got = cli
+        .run_one_shot_verified(&spec, Duration::from_secs(20))
+        .await
+        .unwrap();
+    assert_eq!(got.observed, spec.expected_limits());
+    assert_eq!(
+        calls(&log).last().map(String::as_str),
+        Some("start -a cid-1")
+    );
+
+    // A daemon that reports a looser cap than the floor is refused.
+    let tmp = tempfile::tempdir().unwrap();
+    let user = sandbox_user_for(Some(tmp.path()));
+    let (cli, log) = fake_verified(tmp.path(), &format!("536870912 4096 {user}"), "echo ran");
     assert!(
-        log.iter()
-            .any(|c| c == &format!("ps -q --filter label={label}")),
+        cli.run_one_shot_verified(&OneShot::new(tmp.path(), "true"), Duration::from_secs(20))
+            .await
+            .is_err()
+    );
+    let log = calls(&log);
+    assert!(!log.iter().any(|c| c.starts_with("start")), "{log:?}");
+    assert_eq!(
+        log.last().map(String::as_str),
+        Some("rm -f cid-1"),
         "{log:?}"
     );
 }
