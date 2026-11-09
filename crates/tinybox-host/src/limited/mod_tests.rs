@@ -1,6 +1,14 @@
 //! Bounded collection, simultaneous draining, and supervisor cleanup.
 use super::*;
 
+#[test]
+fn limited_local_host_reports_local_execution_location() {
+    assert_eq!(
+        LimitedLocalHost::new(16).execution_location(),
+        tinybox_core::HostExecutionLocation::Local
+    );
+}
+
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn overflow_terminates_inherited_pipe_descendants_before_drain_returns() -> Result<()> {

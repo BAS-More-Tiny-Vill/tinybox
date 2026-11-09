@@ -363,8 +363,9 @@ async fn run_docker_preserves_one_shot_settings_output_and_timeout()
         "-v",
         &format!("{}:{}:ro", canonical(&readonly)?, canonical(&readonly)?)
     ));
-    assert!(has_pair(&argv, "-e", "MODE=test"));
-    assert!(has_pair(&argv, "-e", "SPACE=a b"));
+    assert!(has_pair(&argv, "-e", "MODE"));
+    assert!(has_pair(&argv, "-e", "SPACE"));
+    assert!(!argv.iter().any(|argument| argument.contains("a b")));
     assert!(has_pair(&argv, "--label", "openhuman.sandbox=true"));
     assert!(has_pair(&argv, "-w", "/workspace"));
     Ok(())
@@ -417,7 +418,8 @@ async fn run_without_workspace_preserves_docker_settings_without_host_mounts()
     assert!(has_pair(&argv, "-m", "1536m"));
     assert!(has_pair(&argv, "--cpus", "1.5"));
     assert!(has_pair(&argv, "--cap-drop", "NET_RAW"));
-    assert!(has_pair(&argv, "-e", "MODE=preserved"));
+    assert!(has_pair(&argv, "-e", "MODE"));
+    assert!(!argv.iter().any(|argument| argument.contains("preserved")));
     assert!(has_pair(&argv, "--label", "openhuman.sandbox=true"));
     assert!(!argv.iter().any(|argument| argument == "-v"));
     assert!(!argv.iter().any(|argument| argument == "-w"));

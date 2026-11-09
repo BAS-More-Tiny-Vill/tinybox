@@ -11,9 +11,19 @@ fn defaults_are_permissive() {
 }
 
 #[test]
-fn requested_resources_become_hard_constraints() {
+fn soft_resource_values_do_not_become_hard_constraints() {
     let mut jail = Jail::new("/tmp", "x");
     jail.resources = Some(tinybox_core::Resources::DEFAULT);
+    assert_eq!(
+        jail.constraints(),
+        vec![tinybox_core::Constraint::Filesystem]
+    );
+    jail = jail.with_hard_requirements([
+        tinybox_core::Constraint::Cpu,
+        tinybox_core::Constraint::Memory,
+        tinybox_core::Constraint::Pids,
+        tinybox_core::Constraint::Disk,
+    ]);
     assert_eq!(
         jail.constraints(),
         vec![
@@ -24,6 +34,25 @@ fn requested_resources_become_hard_constraints() {
             tinybox_core::Constraint::Disk,
         ]
     );
+}
+
+#[test]
+fn hard_network_and_subprocess_requirements_deny_that_access() {
+    use tinybox_core::{Constraint, HostRef, Placement, SandboxRef, WorkspaceSource};
+
+    let jail =
+        Jail::new("/tmp", "x").with_hard_requirements([Constraint::Network, Constraint::Cpu]);
+    assert!(!jail.allow_net);
+    assert!(jail.allow_subprocess);
+    let placement = Placement::new(
+        HostRef::new("local").expect("valid host ref"),
+        SandboxRef::new("noop").expect("valid sandbox ref"),
+    );
+    let spec = tinybox_core::BoxSpec::new(placement, WorkspaceSource::LocalDir("/tmp".into()))
+        .with_hard_requirements([Constraint::Subprocess]);
+    let jail = Jail::new("/tmp", "x").with_box_spec(&spec);
+    assert!(jail.allow_net);
+    assert!(!jail.allow_subprocess);
 }
 
 #[test]
@@ -113,6 +142,98 @@ fn canonicalize_keeps_missing_read_write_as_is() {
 
 #[cfg(unix)]
 #[test]
+fn owned_captured_spawn_preserves_both_pipes_and_exit_status() -> std::io::Result<()> {
+    use std::io::Read;
+    use std::time::{Duration, Instant};
+
+    let root = tempfile::tempdir()?;
+    let jail = Jail::new(root.path(), "owned-captured-spawn");
+    let backend = crate::NoopBackend;
+    let mut command = std::process::Command::new("/bin/sh");
+    command.args([
+        "-c",
+        "printf stdout-marker; printf stderr-marker >&2; exit 23",
+    ]);
+
+    let mut child = crate::spawn_owned_captured_with(&backend, &jail, command)?;
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    child
+        .stdout_mut()
+        .expect("captured stdout")
+        .read_to_string(&mut stdout)?;
+    child
+        .stderr_mut()
+        .expect("captured stderr")
+        .read_to_string(&mut stderr)?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "child did not exit",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+
+    assert_eq!(stdout, "stdout-marker");
+    assert_eq!(stderr, "stderr-marker");
+    assert_eq!(status.code(), Some(23));
+    assert!(!status.success());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn owned_spawn_with_an_approved_environment_drops_everything_else() -> std::io::Result<()> {
+    use std::io::Read;
+
+    let root = tempfile::tempdir()?;
+    let jail = Jail::new(root.path(), "owned-approved-env");
+    let mut command = std::process::Command::new("/bin/sh");
+    command
+        .args([
+            "-c",
+            r#"printf '%s|%s' "${APPROVED-}" "${UNAPPROVED-unset}""#,
+        ])
+        .env("UNAPPROVED", "leaked");
+    let approved = std::collections::BTreeMap::from([("APPROVED".to_owned(), "yes".to_owned())]);
+    let mut child = crate::spawn_owned_captured_with_backend_and_env(
+        &crate::NoopBackend,
+        &jail,
+        command,
+        &approved,
+    )?;
+    let mut stdout = String::new();
+    child
+        .stdout_mut()
+        .expect("captured stdout")
+        .read_to_string(&mut stdout)?;
+    assert_eq!(stdout, "yes|unset");
+    Ok(())
+}
+
+#[cfg(windows)]
+#[test]
+fn owned_captured_spawn_does_not_claim_the_child_pid_as_a_process_group() -> std::io::Result<()> {
+    let root = tempfile::tempdir()?;
+    let jail = Jail::new(root.path(), "owned-captured-spawn");
+    let backend = crate::NoopBackend;
+    let mut command = std::process::Command::new("cmd");
+    command.args(["/C", "exit 0"]);
+
+    let child = crate::spawn_owned_captured_with(&backend, &jail, command)?;
+
+    assert_eq!(child.local_process_group_id(), None);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
 fn canonicalize_deduplicates_denials_that_resolve_through_symlink_aliases() -> std::io::Result<()> {
     use std::os::unix::fs::symlink;
     let root = tempfile::tempdir()?;
@@ -186,4 +307,16 @@ fn the_check_sees_a_planted_link_however_the_root_is_spelled() -> std::io::Resul
         assert_eq!(err, Some(std::io::ErrorKind::InvalidInput), "{grant:?}");
     }
     Ok(())
+}
+
+#[test]
+fn nested_denial_refuses_only_paths_deeper_than_a_direct_child() {
+    let writable = Path::new("/work");
+    assert!(nested_denial(Path::new("/work/secret"), writable).is_none());
+    assert!(nested_denial(Path::new("/elsewhere/a/secret"), writable).is_none());
+    assert!(nested_denial(Path::new("/workshop/a/secret"), writable).is_none());
+    for nested in ["/work/a/secret", "/work/a/b/secret", "/work"] {
+        let error = nested_denial(Path::new(nested), writable).expect(nested);
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{nested}");
+    }
 }

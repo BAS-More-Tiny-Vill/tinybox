@@ -18,13 +18,15 @@ tinybox-core.workspace = true
 tinybox-bus.workspace = true
 tinybox-jail.workspace = true
 async-trait.workspace = true
+# The host supervises async native-shell output and bounded poll delays.
+futures-util = { version = "0.3", features = ["async-await"] }
+futures-timer = "3"
 # `Dir` keeps workspace file handles beneath the approved root without
 # resolving untrusted paths through ambient filesystem APIs.
 cap-std = "4"
-# `LocalHost` spawns a child and reads both its output streams concurrently,
-# which is what `tokio::process` is for; doing it by hand risks deadlocking on a
-# full pipe buffer.
-tokio = { workspace = true, features = ["process", "io-util", "sync"] }
+# `LocalHost` spawns a child and reads both output streams concurrently.
+# `limited::jailed` also adapts backend-owned file pipes for async collection.
+tokio = { workspace = true, features = ["process", "io-util", "sync", "fs", "net"] }
 
 [target.'cfg(unix)'.dependencies]
 # Safe process-group signalling supervises descendants; access checks select executable shells.
@@ -37,6 +39,8 @@ command-group = { version = "5", features = ["with-tokio"] }
 [dev-dependencies]
 # Command tests run against real temporary directories rather than the CWD.
 tempfile = "3"
+# Drives the runtime-neutral native shell orchestration tests without a runtime.
+futures-executor = "0.3"
 
 [lints]
 workspace = true

@@ -9,6 +9,7 @@
 *.profraw
 *.profdata
 lcov.info
+rustc-ice-*.txt
 
 # Local secrets — never commit; copy .env.example to .env
 .env

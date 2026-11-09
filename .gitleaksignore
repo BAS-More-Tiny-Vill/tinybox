@@ -1,0 +1,4 @@
+# Upstream test fixtures, not credentials: short fake ghp_ values passed as GITHUB_TOKEN
+# to check that the bubblewrap jail strips the environment (crates/tinybox-jail/tests/bwrap_isolation.rs).
+9c5630ba45249d494347a646ea745e1f2922c590:crates/tinybox-jail/tests/bwrap_isolation.rs:generic-api-key:404
+8cff8b260bae79bb2f8bbe1610e180ded327cf80:crates/tinybox-jail/tests/bwrap_isolation.rs:generic-api-key:370

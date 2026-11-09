@@ -6,8 +6,13 @@
 //! only happens at runtime. Runtime capability probes are kept separate from
 //! the pure argument builders.
 
-use std::path::Path;
-use tinybox_core::{BoxSpec, Capability, Error, ExecRequest, Resources, Result, WorkspaceSource};
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+use tinybox_core::{
+    BoxSpec, Capability, Constraint, ConstraintSupport, Enforcement, Error, ExecRequest, Resources,
+    Result, WorkspaceSource,
+};
 
 use super::NAME;
 
@@ -22,6 +27,45 @@ pub const WORKSPACE_MOUNT: &str = "/workspace";
 /// else.
 const USR: &str = "/usr";
 const SYSTEMD_EXPAND_ENVIRONMENT_FLAG: &[u8] = b"--expand-environment";
+static NATIVE_SCOPE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ResourceEnforcement {
+    CgroupV2,
+    Setrlimit,
+    Unavailable,
+}
+
+pub(super) const fn select_resource_enforcement(
+    cgroup_v2_delegated: bool,
+    allow_setrlimit_fallback: bool,
+) -> ResourceEnforcement {
+    if cgroup_v2_delegated {
+        ResourceEnforcement::CgroupV2
+    } else if allow_setrlimit_fallback {
+        ResourceEnforcement::Setrlimit
+    } else {
+        ResourceEnforcement::Unavailable
+    }
+}
+
+pub(super) const fn resource_constraint_support(
+    enforcement: ResourceEnforcement,
+) -> ConstraintSupport {
+    match enforcement {
+        ResourceEnforcement::CgroupV2 => ConstraintSupport::NONE
+            .with(Constraint::Cpu, Enforcement::Enforced)
+            .with(Constraint::Memory, Enforcement::Enforced)
+            .with(Constraint::Pids, Enforcement::Enforced),
+        // RLIMIT_AS gives each process in the box a hard address-space ceiling,
+        // but the box's processes together can exceed it, so memory is only
+        // best effort. CPU rate and process count have no equivalent at all.
+        ResourceEnforcement::Setrlimit => {
+            ConstraintSupport::NONE.with(Constraint::Memory, Enforcement::BestEffort)
+        }
+        ResourceEnforcement::Unavailable => ConstraintSupport::NONE,
+    }
+}
 
 /// Files a normal command expects to exist.
 ///
@@ -77,6 +121,62 @@ pub(super) fn exec(
     spec: &BoxSpec,
     request: &ExecRequest,
     limits: bool,
+    setrlimit_fallback: bool,
+    supports_expand_environment: bool,
+) -> Result<Vec<String>> {
+    exec_with_prlimit_resolver(
+        spec,
+        request,
+        limits,
+        setrlimit_fallback,
+        supports_expand_environment,
+        trusted_prlimit_program,
+    )
+}
+
+pub(super) fn exec_with_prlimit_resolver(
+    spec: &BoxSpec,
+    request: &ExecRequest,
+    limits: bool,
+    setrlimit_fallback: bool,
+    supports_expand_environment: bool,
+    resolve_prlimit: impl FnOnce() -> std::io::Result<std::path::PathBuf>,
+) -> Result<Vec<String>> {
+    let prlimit = fallback_prlimit(limits, setrlimit_fallback, resolve_prlimit)?;
+    exec_with_prlimit_program(
+        spec,
+        request,
+        limits,
+        prlimit.as_deref(),
+        supports_expand_environment,
+    )
+}
+
+/// The trusted `prlimit` the setrlimit fallback launches through, when that
+/// fallback is in use.
+///
+/// # Errors
+/// Returns [`Error::Unsupported`] for resource limits when no trusted
+/// `prlimit` exists.
+pub(super) fn fallback_prlimit(
+    limits: bool,
+    setrlimit_fallback: bool,
+    resolve_prlimit: impl FnOnce() -> std::io::Result<std::path::PathBuf>,
+) -> Result<Option<std::path::PathBuf>> {
+    if limits || !setrlimit_fallback {
+        return Ok(None);
+    }
+    resolve_prlimit().map(Some).map_err(|_| Error::Unsupported {
+        sandbox: NAME.to_owned(),
+        capability: Capability::ResourceLimits,
+    })
+}
+
+pub(super) fn exec_with_prlimit_program(
+    spec: &BoxSpec,
+    request: &ExecRequest,
+    limits: bool,
+    prlimit_program: Option<&Path>,
     supports_expand_environment: bool,
 ) -> Result<Vec<String>> {
     if request.argv.is_empty() {
@@ -91,7 +191,39 @@ pub(super) fn exec(
         Vec::new()
     };
     argv.extend(bwrap(spec, request)?);
+    if !limits && let Some(prlimit) = prlimit_program {
+        wrap_setrlimit(&mut argv, &spec.resources, prlimit);
+    }
     Ok(argv)
+}
+
+pub(super) fn wrap_setrlimit(argv: &mut Vec<String>, resources: &Resources, prlimit: &Path) {
+    argv.splice(
+        0..0,
+        [
+            prlimit.to_string_lossy().into_owned(),
+            format!("--as={}", resources.memory_bytes),
+            "--".to_owned(),
+        ],
+    );
+}
+
+pub(super) fn trusted_prlimit_program() -> std::io::Result<std::path::PathBuf> {
+    trusted_program_from([Path::new("/usr/bin/prlimit"), Path::new("/bin/prlimit")])
+}
+
+pub(super) fn trusted_program_from<'a>(
+    paths: impl IntoIterator<Item = &'a Path>,
+) -> std::io::Result<std::path::PathBuf> {
+    paths
+        .into_iter()
+        .find_map(|path| validate_trusted_program(path).ok())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no trusted executable in fixed system locations",
+            )
+        })
 }
 
 /// Wrap the sandbox in a transient systemd scope so cgroup limits apply.
@@ -125,7 +257,7 @@ pub(super) fn cgroup_prefix(
         "--property".to_owned(),
         // systemd takes CPU as a percentage where 100% is one core, and
         // thousandths convert by a factor of ten.
-        format!("CPUQuota={}%", resources.cpu_millis / 10),
+        format!("CPUQuota={}%", cpu_quota(resources.cpu_millis)),
         "--property".to_owned(),
         format!("TasksMax={}", resources.pids_max),
         "--".to_owned(),
@@ -159,8 +291,432 @@ pub(super) fn parse_expand_environment_help(
     }))
 }
 
+/// Convert thousandths of one CPU to systemd's percentage without dropping
+/// the tenth-percent digit (one milli-CPU is `0.1%`, not `0%`).
+fn cpu_quota(cpu_millis: u32) -> String {
+    let whole = cpu_millis / 10;
+    let tenth = cpu_millis % 10;
+    if tenth == 0 {
+        whole.to_string()
+    } else {
+        format!("{whole}.{tenth}")
+    }
+}
+
+/// Fully validated input for the namespace-backed native directory jail.
+/// This is separate from [`BoxSpec`]: a native jail binds the caller's grants
+/// at their declared paths and never broadens them to a workspace image.
+#[derive(Debug, Clone)]
+pub struct NativeJailCommand {
+    /// Writable workspace root.
+    pub root: PathBuf,
+    /// Working directory, required to be under `root`.
+    pub cwd: PathBuf,
+    /// Additional read-only paths.
+    pub read_only: Vec<PathBuf>,
+    /// Additional writable paths.
+    pub read_write: Vec<PathBuf>,
+    /// Paths to mask after applying grants.
+    pub deny_read: Vec<PathBuf>,
+    /// Whether the process may use network sockets.
+    pub allow_net: bool,
+    /// Whether the process may create child processes.
+    pub allow_subprocess: bool,
+    /// Hard CPU limit in thousandths of one CPU.
+    pub cpu_millis: Option<u64>,
+    /// Hard resident memory limit in bytes.
+    pub memory_bytes: Option<u64>,
+    /// Hard task count limit.
+    pub pids_max: Option<u64>,
+    /// Program and arguments, never parsed by a shell.
+    pub argv: Vec<String>,
+    /// Environment installed by bubblewrap only after namespace setup.
+    pub env: BTreeMap<String, String>,
+}
+
+/// Build the trusted systemd-run and bubblewrap launcher for a native jail.
+///
+/// Explicit unsupported dimensions and unsafe request shapes are rejected;
+/// no requested limit is rounded up or dropped.
+///
+/// # Errors
+/// Returns an error when a request is invalid, unsupported, or systemd's
+/// command-argument expansion behavior cannot be verified.
+pub fn native_jail_argv(request: &NativeJailCommand) -> std::io::Result<Vec<String>> {
+    native_jail_argv_with_programs(
+        request,
+        &trusted_systemd_run_program()?,
+        &trusted_bwrap_program()?,
+    )
+}
+
+/// Build the native jail launcher using the already verified Bubblewrap binary
+/// selected by the owning `tinybox-jail` backend.
+///
+/// # Errors
+/// Returns an error unless both launchers are absolute trusted executables and
+/// systemd's command-argument expansion behavior can be verified.
+pub fn native_jail_argv_with_programs(
+    request: &NativeJailCommand,
+    systemd_run: &Path,
+    bwrap: &Path,
+) -> std::io::Result<Vec<String>> {
+    validate_native_jail_command(request)?;
+    let systemd_run = validate_trusted_program(systemd_run)?;
+    let bwrap = validate_trusted_program(bwrap)?;
+    let supports_expand_environment = systemd_run_supports_safe_arguments(&systemd_run)?;
+    let argv = native_bwrap_argv(request, supports_expand_environment, &systemd_run, &bwrap);
+    Ok(native_launcher_argv(wrap_scope_command(argv)))
+}
+
+/// Sample cgroup counters from inside the transient scope before it is stopped.
+fn wrap_scope_command(mut argv: Vec<String>) -> Vec<String> {
+    let Some(delimiter) = argv.iter().position(|arg| arg == "--") else {
+        return argv;
+    };
+    let Some(unit) = argv
+        .iter()
+        .find_map(|arg| arg.strip_prefix("--unit=").map(str::to_owned))
+    else {
+        return argv;
+    };
+    let workload = argv.split_off(delimiter + 1);
+    argv.extend([
+        "/bin/bash".to_owned(),
+        "--noprofile".to_owned(),
+        "--norc".to_owned(),
+        "-c".to_owned(),
+        CPU_EVENT_SCOPE_WRAPPER.to_owned(),
+        "tinybox-cpu-event-scope".to_owned(),
+        unit,
+    ]);
+    argv.extend(workload);
+    argv
+}
+
+const CPU_EVENT_SCOPE_WRAPPER: &str = r#"
+unit=$1
+shift
+"$@"
+status=$?
+report=${TINYBOX_INTERNAL_CPU_EVENT_FILE:-}
+if [ -n "$report" ]; then
+    control_group=$(/usr/bin/systemctl --user show --property=ControlGroup --value "$unit" 2>/dev/null)
+    stats=
+    case $control_group in /*) stats=/sys/fs/cgroup${control_group}/cpu.stat;; esac
+    if [ -r "$stats" ]; then
+        { stat=$(<"$stats") && printf '%s\n' "$stat" > "$report"; } 2>/dev/null || :
+    fi
+fi
+exit "$status"
+"#;
+
+/// Find systemd-run only in fixed system locations and return its trusted
+/// canonical path. This does not consult the caller's `PATH`.
+///
+/// # Errors
+/// Returns `NotFound` when no trusted executable is available in those paths.
+pub fn trusted_systemd_run_program() -> std::io::Result<std::path::PathBuf> {
+    [
+        Path::new("/usr/bin/systemd-run"),
+        Path::new("/usr/local/bin/systemd-run"),
+        Path::new("/bin/systemd-run"),
+    ]
+    .into_iter()
+    .find_map(|path| validate_trusted_program(path).ok())
+    .ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no trusted systemd-run executable in fixed system locations",
+        )
+    })
+}
+
+fn trusted_bwrap_program() -> std::io::Result<std::path::PathBuf> {
+    [Path::new("/usr/bin/bwrap"), Path::new("/bin/bwrap")]
+        .into_iter()
+        .find_map(|path| validate_trusted_program(path).ok())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no trusted bwrap executable in fixed system locations",
+            )
+        })
+}
+
+#[cfg(unix)]
+fn validate_trusted_program(path: &Path) -> std::io::Result<std::path::PathBuf> {
+    use std::io::{Error, ErrorKind};
+    use std::os::unix::fs::MetadataExt as _;
+    if !path.is_absolute() {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            "launcher path must be absolute",
+        ));
+    }
+    let canonical = path.canonicalize()?;
+    let mut current = std::path::PathBuf::from("/");
+    for component in canonical.components().skip(1) {
+        current.push(component);
+        let metadata = std::fs::metadata(&current)?;
+        if metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                "launcher path has a non-root-owned or writable ancestor",
+            ));
+        }
+    }
+    let metadata = std::fs::metadata(&canonical)?;
+    if !metadata.is_file() || metadata.mode() & 0o111 == 0 {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            "launcher is not executable",
+        ));
+    }
+    Ok(canonical)
+}
+
+#[cfg(not(unix))]
+fn validate_trusted_program(_path: &Path) -> std::io::Result<std::path::PathBuf> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "native Linux launchers require Unix filesystem ownership and mode checks",
+    ))
+}
+
+fn validate_native_jail_command(request: &NativeJailCommand) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    let invalid = || Error::new(ErrorKind::InvalidInput, "invalid native jail command");
+    if request.argv.is_empty()
+        || request.argv.iter().any(|part| part.contains('\0'))
+        || request.argv[0].is_empty()
+        || request
+            .env
+            .iter()
+            .any(|(key, value)| key.is_empty() || key.contains(['=', '\0']) || value.contains('\0'))
+        || request.deny_read.iter().any(|denied| {
+            request.root.starts_with(denied)
+                || request
+                    .read_write
+                    .iter()
+                    .any(|grant| grant.starts_with(denied))
+        })
+        || !request.cwd.starts_with(&request.root)
+        || !matches!(request.root.canonicalize(), Ok(root) if root.is_dir() && root == request.root)
+        || !matches!(request.cwd.canonicalize(), Ok(cwd) if cwd.starts_with(&request.root) && cwd == request.cwd)
+        || request
+            .read_only
+            .iter()
+            .chain(&request.read_write)
+            .any(|path| !matches!(path.canonicalize(), Ok(canonical) if canonical == *path))
+        || std::iter::once(&request.root)
+            .chain(&request.read_only)
+            .chain(&request.read_write)
+            .any(|path| {
+                ["/run", "/sys", "/proc"]
+                    .iter()
+                    .any(|protected| path.starts_with(protected))
+            })
+    {
+        return Err(invalid());
+    }
+    if request.cpu_millis == Some(0)
+        || request.memory_bytes == Some(0)
+        || request.pids_max == Some(0)
+    {
+        return Err(invalid());
+    }
+    if request.cpu_millis.is_none() && request.memory_bytes.is_none() && request.pids_max.is_none()
+    {
+        return Err(invalid());
+    }
+    if request.allow_net {
+        return Err(Error::new(
+            ErrorKind::Unsupported,
+            "resource-aware native jail requires a private network namespace",
+        ));
+    }
+    if !request.allow_subprocess {
+        return Err(Error::new(
+            ErrorKind::Unsupported,
+            "subprocess denial is unsupported",
+        ));
+    }
+
+    Ok(())
+}
+
+fn systemd_run_supports_safe_arguments(systemd_run: &Path) -> std::io::Result<bool> {
+    use std::io::{Error, ErrorKind};
+    // `systemd-run` versions that support variable expansion apply it to
+    // command arguments before starting bwrap. Probe the same advertised
+    // capability used by the owning namespace backend and disable expansion
+    // before placing any target-controlled argv on the command line.
+    let probe = std::process::Command::new(systemd_run)
+        .arg("--help")
+        .env("LC_ALL", "C")
+        .output()?;
+    let supports_expand_environment =
+        parse_expand_environment_help(probe.status.success(), &probe.stdout, &probe.stderr)
+            .map_err(|_| {
+                Error::new(
+                    ErrorKind::Unsupported,
+                    "cannot verify systemd-run argument handling",
+                )
+            })?;
+    Ok(supports_expand_environment)
+}
+
+fn native_bwrap_argv(
+    request: &NativeJailCommand,
+    supports_expand_environment: bool,
+    systemd_run: &Path,
+    bwrap: &Path,
+) -> Vec<String> {
+    let mut argv = vec![
+        systemd_run.display().to_string(),
+        "--user".to_owned(),
+        "--scope".to_owned(),
+        "--quiet".to_owned(),
+        format!(
+            "--unit=tinybox-native-{}-{}.scope",
+            std::process::id(),
+            NATIVE_SCOPE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ),
+    ];
+    if supports_expand_environment {
+        argv.push("--expand-environment=no".into());
+    }
+    if let Some(value) = request.memory_bytes {
+        argv.push(format!("--property=MemoryMax={value}"));
+        argv.push("--property=MemorySwapMax=0".to_owned());
+        // Keep the scope present long enough for its supervisor and observers
+        // to report the kernel OOM event and complete bounded cleanup.
+        argv.push("--property=OOMPolicy=continue".to_owned());
+    }
+    if let Some(value) = request.cpu_millis {
+        argv.push(format!("--property=CPUQuota={}%", cpu_quota_u64(value)));
+    }
+    if let Some(value) = request.pids_max {
+        argv.push(format!("--property=TasksMax={value}"));
+    }
+    argv.push("--".to_owned());
+    argv.push(bwrap.display().to_string());
+    for flag in [
+        "--unshare-user",
+        "--unshare-pid",
+        "--unshare-ipc",
+        "--unshare-uts",
+        "--unshare-cgroup",
+    ] {
+        argv.push(flag.to_owned());
+    }
+    // The private network namespace also isolates AF_UNIX abstract sockets,
+    // closing the same-UID user-manager escape path.
+    argv.push("--unshare-net".to_owned());
+    argv.extend(["--die-with-parent".into(), "--new-session".into()]);
+    argv.extend(root_filesystem());
+    // A user-scope manager socket or host cgroup filesystem would let a
+    // same-UID workload escape the transient resource scope.
+    argv.extend([
+        "--tmpfs".into(),
+        "/run".into(),
+        "--tmpfs".into(),
+        "/sys".into(),
+    ]);
+    ensure_mount_parents(&mut argv, request);
+    argv.extend([
+        "--bind".into(),
+        request.root.display().to_string(),
+        request.root.display().to_string(),
+    ]);
+    for (source, destination, mode) in request
+        .read_only
+        .iter()
+        .map(|path| (path, path, "--ro-bind"))
+        .chain(request.read_write.iter().map(|path| (path, path, "--bind")))
+    {
+        argv.extend([
+            mode.into(),
+            source.display().to_string(),
+            destination.display().to_string(),
+        ]);
+    }
+    for denied in &request.deny_read {
+        if denied.is_dir() {
+            argv.extend(["--tmpfs".into(), denied.display().to_string()]);
+        } else {
+            argv.extend([
+                "--ro-bind".into(),
+                "/dev/null".into(),
+                denied.display().to_string(),
+            ]);
+        }
+    }
+    argv.extend([
+        "--chdir".into(),
+        request.cwd.display().to_string(),
+        "--clearenv".into(),
+    ]);
+    for (key, value) in &request.env {
+        argv.extend(["--setenv".into(), key.clone(), value.clone()]);
+    }
+    argv.push("--".into());
+    argv.extend(request.argv.iter().cloned());
+    // A scope launcher inherits the host process's descriptors. The trusted
+    // shim closes every non-stdio descriptor before opening systemd's bus or
+    // starting bubblewrap, preventing a pre-opened manager/cgroup FD from
+    // bypassing the mount and network namespaces. Target values remain argv
+    // data and the shim receives only a fixed, sanitized launcher environment.
+    argv
+}
+
+fn native_launcher_argv(argv: Vec<String>) -> Vec<String> {
+    let mut launcher = vec![
+        "/bin/bash".to_owned(),
+        "--noprofile".to_owned(),
+        "--norc".to_owned(),
+        "-c".to_owned(),
+        "[ -d /proc/self/fd ] || exit 125; shopt -s nullglob; fdpaths=(/proc/self/fd/*); ((${#fdpaths[@]} > 0)) || exit 125; for fdpath in \"${fdpaths[@]}\"; do fd=${fdpath##*/}; case $fd in 0|1|2|*[!0-9]*) continue;; esac; eval \"exec ${fd}>&-\" || exit 125; done; unit=; for arg in \"$@\"; do case $arg in --unit=*) unit=${arg#--unit=};; esac; done; [ -n \"$unit\" ] || exit 125; \"$@\"; status=$?; if ! /usr/bin/systemctl --user stop \"$unit\"; then /usr/bin/systemctl --user is-active --quiet \"$unit\" && exit 125; fi; exit \"$status\"".to_owned(),
+        "tinybox-native-launcher".to_owned(),
+    ];
+    launcher.extend(argv);
+    launcher
+}
+
+fn cpu_quota_u64(cpu_millis: u64) -> String {
+    let whole = cpu_millis / 10;
+    let tenth = cpu_millis % 10;
+    if tenth == 0 {
+        whole.to_string()
+    } else {
+        format!("{whole}.{tenth}")
+    }
+}
+
+fn ensure_mount_parents(argv: &mut Vec<String>, request: &NativeJailCommand) {
+    let mut dirs = std::collections::BTreeSet::new();
+    for path in std::iter::once(&request.root)
+        .chain(&request.read_only)
+        .chain(&request.read_write)
+        .chain(&request.deny_read)
+    {
+        let mut parent = path.parent();
+        while let Some(path) = parent {
+            if path == Path::new("/") {
+                break;
+            }
+            dirs.insert(path.to_path_buf());
+            parent = path.parent();
+        }
+    }
+    for dir in dirs {
+        argv.extend(["--dir".into(), dir.display().to_string()]);
+    }
+}
+
 /// The `bwrap` invocation itself.
-fn bwrap(spec: &BoxSpec, request: &ExecRequest) -> Result<Vec<String>> {
+pub(super) fn bwrap(spec: &BoxSpec, request: &ExecRequest) -> Result<Vec<String>> {
     let workspace = workspace_dir(spec)?;
     let mut argv = vec!["bwrap".to_owned()];
 

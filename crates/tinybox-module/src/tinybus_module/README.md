@@ -55,7 +55,7 @@ The interface is `ai.tinyhumans.tinybox.Box` at
 | KillStdio | ProcessRef | () |
 | StdioStatus | ProcessRef | StdioStatus |
 
-Capabilities advertises contract version 2.1. Hosts require equal majors and a
+Capabilities advertises contract version 2.3. Hosts require equal majors and a
 module minor at least as new as their vocabulary, using
 `tinybox_bus::is_compatible`. Contract 1.0 was the original discovery-only
 surface; 1.1 added reserved resource/process ownership and terminal shutdown;
@@ -75,6 +75,21 @@ occurs outside heredoc data. TinySecurity owns command classification and
 execution policy. Old 1.x hosts must reject a 2.x module; there is no fallback
 that applies or reconstructs command policy in TinyBox. Describe remains
 unchanged.
+
+Contract 2.1 adds resource-aware native jail request members. Contract 2.2 adds
+the `ProcessEvent` signal, carrying the caller's `ProcessRef` with each
+observation. The module emits `Started` once after a successful `StartExec`,
+`StartJailedExec`, `StartJailedExecWithResources`, `StartShellExec`, or
+`StartNativeShellExec`, then `Exited` after its supervisor observes the
+terminal exit status. When an execution times out, it emits
+`LimitHit { limit: Timeout }` before `Exited { status: None }`. Replayed starts
+do not duplicate these events. Signal delivery is best-effort; this increment
+also emits `LimitHit { limit: Cpu }` before exit when the trusted Linux
+cgroup-v2 CPU counter proves that a scoped CPU quota throttled the workload.
+This reports throttling, not CPU exhaustion or process termination. Other
+resource-limit observations remain unpublished. Contract 2.3 adds
+`RunNativeShell` and the `openshell` backend without changing any 2.2 request
+or reply shape; see `docs/specs/contract-2-3.md`.
 
 Version 1.5 adds bounded file transfer for mounted directory workspaces.
 Reserve `FileRead(resource)` or `FileWrite(resource)` before opening a transfer.
@@ -260,7 +275,9 @@ The host retains approval policy and chooses the credential paths; it sends them
 as `deny_read` (1.20). The module retains prospective paths and resolves them
 against current filesystem aliases both at preflight and immediately before
 spawn. It refuses a denial covering the root or a writable grant. Seatbelt can
-carve a nested denial out of a writable grant; allow-list backends refuse any
+carve a denial that is a direct child of a writable grant (or of the root or
+`/private/tmp`), and refuses a deeper one, which a rename of the directory in
+between would move out of its path-based rule; allow-list backends refuse any
 overlap they cannot subtract. Landlock reports its implicit system and device
 baseline grants so credential denials cannot be overridden by those grants;
 direct Landlock backend calls repeat this check at spawn. Paths outside every
@@ -428,8 +445,12 @@ Version 2.0 removes TinyBox command classification and execution-policy results
 after the contract 1.22 deprecation window. Hosts must reject modules from a
 different contract major. See `docs/specs/contract-2-0.md`.
 
-Contract 2.1 adds Docker timeout cleanup evidence (`killed`) and measured elapsed
+This fork carries an additive Docker extension inside contract 2.3 (it is not
+upstream's contract 2.1, which is the resource-aware native jail members above):
+optional Docker timeout cleanup evidence (`killed`) and measured elapsed
 milliseconds (`duration_ms`). One-shot execution enforces a non-root identity and
 process cap, drains bounded output, and keeps supervising an abandoned caller
-until targeted deadline cleanup completes. Hosts must not infer a confirmed kill
-from `timed_out` alone; see `docs/specs/contract-2-1.md`.
+until targeted deadline cleanup completes. The contract version cannot detect
+this extension, so hosts must not gate on it: they must treat absent `killed`
+evidence as unknown cleanup and must not infer a confirmed kill from `timed_out`
+alone; see `docs/specs/contract-2-1.md` (the fork Docker extension document).

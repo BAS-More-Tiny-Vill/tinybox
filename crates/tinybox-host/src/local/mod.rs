@@ -5,7 +5,8 @@ pub(crate) mod shell;
 use async_trait::async_trait;
 use std::path::Path;
 use tinybox_core::{
-    Error, ExecOutput, ExecRequest, Forward, Host, Result, WorkspaceFileReader, WorkspaceFileWriter,
+    Error, ExecOutput, ExecRequest, Forward, Host, HostExecutionLocation, Result,
+    WorkspaceFileReader, WorkspaceFileWriter,
 };
 use tokio::io::AsyncWriteExt as _;
 use tokio::process::Command;
@@ -69,6 +70,10 @@ impl LocalHost {
 impl Host for LocalHost {
     fn name(&self) -> &'static str {
         NAME
+    }
+
+    fn execution_location(&self) -> HostExecutionLocation {
+        HostExecutionLocation::Local
     }
 
     /// Run a command to completion and collect its output.

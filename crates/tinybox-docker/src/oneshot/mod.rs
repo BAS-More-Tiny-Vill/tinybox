@@ -225,15 +225,17 @@ impl OneShot {
             push(&format!("{0}:{0}:ro", ro.display()));
         }
 
-        for (key, value) in &self.env {
-            let mut assignment = key.clone();
-            assignment.push("=");
-            assignment.push(value);
+        // Names only: the values reach the docker client through its own
+        // environment (see `execution::run`), so they never sit on an argv that
+        // any local user can read from the process table.
+        for (key, _) in &self.env {
             argv.push(OsString::from("-e"));
-            argv.push(assignment);
+            argv.push(key.clone());
         }
 
         let mut push = |s: &str| argv.push(OsString::from(s));
+        // End docker's options so an image like `--privileged` stays a positional.
+        push("--");
         push(&self.image);
         push("sh");
         push(if self.login_shell { "-lc" } else { "-c" });

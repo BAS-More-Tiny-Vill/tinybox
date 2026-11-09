@@ -2,6 +2,9 @@
 
 use std::{
     collections::HashMap,
+    io::Write as _,
+    net::SocketAddr,
+    path::Path,
     sync::{
         Arc, Mutex, MutexGuard, PoisonError,
         atomic::{AtomicBool, Ordering},
@@ -12,9 +15,12 @@ use std::{
 use async_trait::async_trait;
 use tinybox_core::{
     BoxId, BoxInfo, BoxSpec, BoxState, Capability, Clock, Error, ExecOutput, ExecRequest,
-    ExecutionObserver, Host, IsolationLevel, OutputStream, PortMapping, ProcessId, Result, Sandbox,
-    SandboxCapabilities, SnapshotId, SnapshotSupport, Store, SystemClock, detach,
+    ExecutionObserver, Forward, Host, HostExecutionLocation, IsolationLevel, NetworkPolicy,
+    OutputStream, PortMapping, ProcessId, Result, Sandbox, SandboxCapabilities, SnapshotId,
+    SnapshotSupport, Store, SystemClock, WorkspaceFileReader, WorkspaceFileWriter, detach,
 };
+
+use crate::{DockerEgressController, PreparedEgressNetwork};
 
 mod args;
 mod observed;
@@ -46,11 +52,210 @@ pub const NAME: &str = "docker";
 pub struct DockerSandbox {
     host: Arc<dyn Host>,
     store: Arc<dyn Store>,
+    egress_controller: Option<Arc<dyn DockerEgressController>>,
     clock: Arc<dyn Clock>,
     namespace: String,
     failed_create_attempts: Arc<std::sync::Mutex<HashMap<BoxId, String>>>,
     pending_observed_cleanup: Arc<Mutex<HashMap<String, CleanupHandle>>>,
     observed_boxes: Arc<Mutex<HashMap<BoxId, ObservedBoxState>>>,
+}
+
+#[derive(Debug)]
+struct ControllerHost {
+    inner: Arc<dyn Host>,
+    controller: Arc<dyn DockerEgressController>,
+}
+
+impl ControllerHost {
+    fn request(&self, request: &ExecRequest) -> Result<PreparedDockerRequest> {
+        let mut request = request.clone();
+        let is_docker_command = request
+            .argv
+            .first()
+            .is_some_and(|program| program == "docker");
+        let should_rewrite = is_docker_command
+            && (!self.controller.requires_local_docker_host()
+                || self.inner.execution_location() == HostExecutionLocation::Local);
+        if should_rewrite {
+            request.argv = self.controller.docker_argv(request.argv);
+        }
+        let env_file = if self.controller.requires_local_docker_host()
+            && self.inner.execution_location() == HostExecutionLocation::Local
+        {
+            write_workload_docker_env_file(&mut request)?
+        } else {
+            None
+        };
+        Ok(PreparedDockerRequest {
+            request,
+            _env_file: env_file,
+        })
+    }
+}
+
+struct PreparedDockerRequest {
+    request: ExecRequest,
+    // Keep the mode-0600 file alive until Docker has read it. Drop removes it
+    // after success, error, or cancellation of the host operation.
+    _env_file: Option<tempfile::NamedTempFile>,
+}
+
+fn write_workload_docker_env_file(
+    request: &mut ExecRequest,
+) -> Result<Option<tempfile::NamedTempFile>> {
+    const KEYS: [&str; 2] = ["DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH"];
+    let values = KEYS
+        .iter()
+        .filter_map(|key| request.env.get(*key).map(|value| (*key, value.clone())))
+        .collect::<Vec<_>>();
+    for key in KEYS {
+        request.env.insert(key.to_owned(), String::new());
+    }
+    if values.is_empty() {
+        return Ok(None);
+    }
+    let subcommand = request
+        .argv
+        .iter()
+        .position(|part| part == "run" || part == "exec");
+    if subcommand.is_none() {
+        return Err(Error::Backend {
+            sandbox: NAME.to_owned(),
+            operation: "preserve Docker workload environment",
+            message: "Docker environment files are supported only for run and exec".to_owned(),
+        });
+    }
+    if subcommand.is_some_and(|index| {
+        request.argv[index] == "run" && !request.argv[index + 1..].iter().any(|part| part == "--")
+    }) {
+        return Err(Error::Backend {
+            sandbox: NAME.to_owned(),
+            operation: "preserve Docker workload environment",
+            message: "docker run must separate its image and workload arguments with --".to_owned(),
+        });
+    }
+    if values.iter().any(|(_, value)| value.contains(['\n', '\r'])) {
+        return Err(Error::Backend {
+            sandbox: NAME.to_owned(),
+            operation: "preserve Docker workload environment",
+            message: "DOCKER_TLS_VERIFY and DOCKER_CERT_PATH cannot contain newlines".to_owned(),
+        });
+    }
+
+    let mut file = tempfile::Builder::new()
+        .prefix("tinybox-docker-env-")
+        .tempfile()
+        .map_err(|error| Error::io("create Docker workload environment file", &error))?;
+    for (key, value) in &values {
+        writeln!(file, "{key}={value}")
+            .map_err(|error| Error::io("write Docker workload environment file", &error))?;
+    }
+
+    request.argv =
+        add_docker_env_file_flag(std::mem::take(&mut request.argv), file.path(), &values);
+    Ok(Some(file))
+}
+
+fn add_docker_env_file_flag(
+    mut argv: Vec<String>,
+    path: &Path,
+    values: &[(&str, String)],
+) -> Vec<String> {
+    if argv.first().is_none_or(|program| program != "docker") {
+        return argv;
+    }
+    let Some(subcommand) = argv.iter().position(|part| part == "run" || part == "exec") else {
+        return argv;
+    };
+    let run_command = argv[subcommand] == "run";
+    let mut options_end = if run_command {
+        argv.iter()
+            .enumerate()
+            .skip(subcommand + 1)
+            .find_map(|(index, part)| (part == "--").then_some(index))
+            .unwrap_or(argv.len())
+    } else {
+        let mut index = subcommand + 1;
+        while let Some(argument) = argv.get(index) {
+            match argument.as_str() {
+                "--env" | "-e" | "--env-file" | "--workdir" | "-w" | "--user" => {
+                    index = (index + 2).min(argv.len());
+                }
+                _ if argument.starts_with('-') => index += 1,
+                _ => break,
+            }
+        }
+        index
+    };
+
+    let mut index = subcommand + 1;
+    while index + 1 < options_end {
+        if argv[index] == "--env" && values.iter().any(|(key, _)| argv[index + 1] == *key) {
+            argv.drain(index..=index + 1);
+            options_end -= 2;
+        } else {
+            index += 1;
+        }
+    }
+    argv.insert(subcommand + 1, "--env-file".to_owned());
+    argv.insert(subcommand + 2, path.display().to_string());
+    argv
+}
+
+#[async_trait]
+impl Host for ControllerHost {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn execution_location(&self) -> HostExecutionLocation {
+        self.inner.execution_location()
+    }
+
+    async fn run(&self, request: &ExecRequest) -> Result<ExecOutput> {
+        let PreparedDockerRequest { request, _env_file } = self.request(request)?;
+        self.inner.run(&request).await
+    }
+
+    async fn run_observed(
+        &self,
+        request: &ExecRequest,
+        observer: Arc<dyn ExecutionObserver>,
+    ) -> Result<ExecOutput> {
+        let PreparedDockerRequest { request, _env_file } = self.request(request)?;
+        self.inner.run_observed(&request, observer).await
+    }
+
+    fn has_pending_observed_cleanup(&self) -> bool {
+        self.inner.has_pending_observed_cleanup()
+    }
+
+    async fn retry_observed_cleanup(&self) -> Result<()> {
+        self.inner.retry_observed_cleanup().await
+    }
+
+    async fn open_workspace_file(
+        &self,
+        root: &Path,
+        relative: &Path,
+    ) -> Result<Box<dyn WorkspaceFileReader>> {
+        self.inner.open_workspace_file(root, relative).await
+    }
+
+    async fn begin_workspace_file_write(
+        &self,
+        root: &Path,
+        relative: &Path,
+        transfer_id: &str,
+    ) -> Result<Box<dyn WorkspaceFileWriter>> {
+        self.inner
+            .begin_workspace_file_write(root, relative, transfer_id)
+            .await
+    }
+
+    async fn forward(&self, remote: SocketAddr) -> Result<Forward> {
+        self.inner.forward(remote).await
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -122,6 +327,10 @@ impl ExecutionObserver for DockerExecutionObserver {
         self.inner.output(stream, bytes)
     }
 
+    fn termination_cause(&self, cause: tinybox_core::TerminationCause) {
+        self.inner.termination_cause(cause);
+    }
+
     async fn cancelled(&self) {
         self.inner.cancelled().await;
         match cleanup_remote(self.host.clone(), &self.namespace, &self.handle).await {
@@ -142,6 +351,142 @@ impl ExecutionObserver for DockerExecutionObserver {
 pub const DEFAULT_NAMESPACE: &str = "default";
 
 impl DockerSandbox {
+    async fn validate_network_policy(&self, spec: &BoxSpec) -> Result<()> {
+        if let NetworkPolicy::Allowlist(_) = &spec.network {
+            let Some(controller) = &self.egress_controller else {
+                return Err(unsupported_egress_policy());
+            };
+            controller.validate_host(self.host.as_ref()).await?;
+        } else {
+            spec.network.refuse_allowlist(self.name())?;
+        }
+        Ok(())
+    }
+
+    async fn prepare_egress_network(
+        &self,
+        spec: &BoxSpec,
+        id: &BoxId,
+        attempt: &str,
+    ) -> Result<Option<PreparedEgressNetwork>> {
+        let NetworkPolicy::Allowlist(allowlist) = &spec.network else {
+            return Ok(None);
+        };
+        let Some(controller) = &self.egress_controller else {
+            self.discard_failed_create_record(id, attempt);
+            return Err(unsupported_egress_policy());
+        };
+        match controller
+            .prepare(self.host.as_ref(), &self.namespace, id, allowlist)
+            .await
+        {
+            Ok(network) => Ok(Some(network)),
+            Err(error) => {
+                if matches!(&error, Error::EgressRollbackFailed { .. }) {
+                    self.remember_failed_create_attempt(id, attempt);
+                } else {
+                    self.discard_failed_create_record(id, attempt);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    async fn rollback_failed_create(
+        &self,
+        id: &BoxId,
+        attempt: &str,
+        has_egress_network: bool,
+        error: Error,
+    ) -> Error {
+        if has_egress_network {
+            self.rollback_failed_egress_create(id, attempt, error).await
+        } else {
+            self.discard_failed_create_record(id, attempt);
+            error
+        }
+    }
+
+    async fn reconcile_failed_create(
+        &self,
+        id: &BoxId,
+        attempt: &str,
+        has_egress_network: bool,
+        error: Error,
+    ) -> Error {
+        if is_name_conflict(&error) {
+            return self
+                .rollback_failed_create(id, attempt, has_egress_network, error)
+                .await;
+        }
+
+        match self
+            .docker(
+                "inspect the failed create",
+                args::inspect_attempt(&self.namespace, id),
+            )
+            .await
+        {
+            Ok(owner) if owner == attempt => {
+                if self
+                    .remove_container(args::remove(&self.namespace, id))
+                    .await
+                    .is_err()
+                {
+                    self.remember_failed_create_attempt(id, attempt);
+                    return error;
+                }
+                if !self
+                    .cleanup_failed_egress_network(id, attempt, has_egress_network)
+                    .await
+                {
+                    return error;
+                }
+                self.discard_failed_create_record(id, attempt);
+            }
+            Ok(_) => {
+                if !self
+                    .cleanup_failed_egress_network(id, attempt, has_egress_network)
+                    .await
+                {
+                    return error;
+                }
+                self.discard_failed_create_record(id, attempt);
+            }
+            Err(Error::Backend { message, .. }) if message.contains("No such container") => {
+                if !self
+                    .cleanup_failed_egress_network(id, attempt, has_egress_network)
+                    .await
+                {
+                    return error;
+                }
+                self.discard_failed_create_record(id, attempt);
+            }
+            Err(_) => self.remember_failed_create_attempt(id, attempt),
+        }
+        error
+    }
+
+    async fn cleanup_failed_egress_network(
+        &self,
+        id: &BoxId,
+        attempt: &str,
+        has_egress_network: bool,
+    ) -> bool {
+        if has_egress_network && self.cleanup_egress(id).await.is_err() {
+            self.remember_failed_create_attempt(id, attempt);
+            return false;
+        }
+        true
+    }
+
+    fn remember_failed_create_attempt(&self, id: &BoxId, attempt: &str) {
+        self.failed_create_attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id.clone(), attempt.to_owned());
+    }
+
     /// Run containers via `docker` on `host`, recording boxes in `store`.
     ///
     /// Uses [`DEFAULT_NAMESPACE`]. Two stores on one machine that both allocate
@@ -153,6 +498,7 @@ impl DockerSandbox {
         Self {
             host,
             store,
+            egress_controller: None,
             clock: Arc::new(SystemClock::new()),
             namespace: DEFAULT_NAMESPACE.to_owned(),
             failed_create_attempts: Arc::default(),
@@ -195,6 +541,7 @@ impl DockerSandbox {
         Ok(Self {
             host,
             store,
+            egress_controller: None,
             clock: Arc::new(SystemClock::new()),
             namespace,
             failed_create_attempts: Arc::default(),
@@ -215,9 +562,19 @@ impl DockerSandbox {
     /// different host.
     #[must_use]
     pub fn for_observed_host(&self, host: Arc<dyn Host>) -> Self {
+        let host = self
+            .egress_controller
+            .as_ref()
+            .map_or(host.clone(), |controller| {
+                Arc::new(ControllerHost {
+                    inner: host,
+                    controller: controller.clone(),
+                }) as Arc<dyn Host>
+            });
         Self {
             host,
             store: self.store.clone(),
+            egress_controller: self.egress_controller.clone(),
             clock: self.clock.clone(),
             namespace: self.namespace.clone(),
             failed_create_attempts: self.failed_create_attempts.clone(),
@@ -230,6 +587,26 @@ impl DockerSandbox {
     #[must_use]
     pub fn namespace(&self) -> &str {
         &self.namespace
+    }
+
+    /// Install a controller for per-box egress allowlists.
+    ///
+    /// The default sandbox has no controller and continues to refuse
+    /// [`NetworkPolicy::Allowlist`]. The controller must verify the execution
+    /// host and Docker daemon, and install its default-drop filter before the
+    /// workload starts.
+    #[must_use]
+    pub fn with_egress_controller(mut self, controller: Arc<dyn DockerEgressController>) -> Self {
+        self.host = Arc::new(ControllerHost {
+            inner: self.host.clone(),
+            controller: controller.clone(),
+        });
+        self.egress_controller = Some(controller);
+        self
+    }
+
+    async fn run_docker(&self, request: &ExecRequest) -> Result<ExecOutput> {
+        self.host.run(request).await
     }
 
     /// What this sandbox declares.
@@ -263,7 +640,16 @@ impl DockerSandbox {
     /// completed a create before its response was lost, so callers reconcile
     /// that case by checking the created container's ownership label.
     async fn docker(&self, operation: &'static str, argv: Vec<String>) -> Result<String> {
-        let output = self.host.run(&ExecRequest::new(argv)).await?;
+        self.docker_request(operation, ExecRequest::new(argv)).await
+    }
+
+    /// [`Self::docker`] for a request that also carries the client's environment.
+    async fn docker_request(
+        &self,
+        operation: &'static str,
+        request: ExecRequest,
+    ) -> Result<String> {
+        let output = self.run_docker(&request).await?;
         if !output.succeeded() {
             return Err(Error::Backend {
                 sandbox: NAME.to_owned(),
@@ -277,7 +663,7 @@ impl DockerSandbox {
     /// Remove a named container, treating Docker's explicit missing-container
     /// response as an already-completed cleanup.
     async fn remove_container(&self, argv: Vec<String>) -> Result<()> {
-        let output = self.host.run(&ExecRequest::new(argv)).await?;
+        let output = self.run_docker(&ExecRequest::new(argv)).await?;
         if output.succeeded() || output.stderr_lossy().contains("No such container") {
             return Ok(());
         }
@@ -393,7 +779,20 @@ impl Sandbox for DockerSandbox {
 
     async fn create(&self, spec: &BoxSpec) -> Result<BoxInfo> {
         spec.validate()?;
-        spec.network.refuse_allowlist(self.name())?;
+        self.require_spec(spec)?;
+        self.validate_network_policy(spec).await?;
+        // The workspace is bind-mounted read-write, so it gets the one-shot
+        // mount policy before any record or container exists.
+        // ponytail: through an SSH host the daemon's filesystem is remote, so
+        // only the lexical checks apply; resolve on that host if it matters.
+        if let tinybox_core::WorkspaceSource::LocalDir(path) = &spec.source
+            && path.to_str().is_none_or(crate::policy::is_dangerous_mount)
+        {
+            return Err(Error::UnsupportedWorkspaceSource {
+                sandbox: NAME.to_owned(),
+                kind: "dangerous host directory",
+            });
+        }
         let attempt = uuid::Uuid::new_v4().to_string();
         // Claim the record first. A container is expensive to create and has to
         // be torn down if the record cannot be written, so taking the cheap
@@ -401,63 +800,30 @@ impl Sandbox for DockerSandbox {
         let info =
             tinybox_core::insert_new(self.store.as_ref(), BoxState::Ready, spec, self.clock.now())?;
 
+        // Resolve and install the default-drop filter before Docker starts the
+        // image entrypoint. The controller is the only path that can make an
+        // allowlist runnable.
+        let network = self
+            .prepare_egress_network(spec, &info.id, &attempt)
+            .await?;
+
         // Build the command before running anything, so a source this backend
         // cannot handle leaves no container behind.
-        let argv = match args::run(&self.namespace, &info.id, &attempt, spec) {
+        let argv = match args::run(&self.namespace, &info.id, &attempt, spec, network.as_ref()) {
             Ok(argv) => argv,
             Err(error) => {
-                self.discard_failed_create_record(&info.id, &attempt);
-                return Err(error);
+                return Err(self
+                    .rollback_failed_create(&info.id, &attempt, network.is_some(), error)
+                    .await);
             }
         };
 
-        if let Err(error) = self.docker("create the container", argv).await {
-            // Docker reports a name collision before creating a container.
-            // Never remove that name: it belongs to the pre-existing owner.
-            if is_name_conflict(&error) {
-                self.discard_failed_create_record(&info.id, &attempt);
-                return Err(error);
-            }
-
-            // A lost response can hide a successful create. Reconcile only
-            // after the daemon confirms this exact attempt token; otherwise a
-            // deterministic name may refer to another store's container with
-            // the same box id.
-            match self
-                .docker(
-                    "inspect the failed create",
-                    args::inspect_attempt(&self.namespace, &info.id),
-                )
-                .await
-            {
-                Ok(owner) if owner == attempt => {
-                    if self
-                        .remove_container(args::remove(&self.namespace, &info.id))
-                        .await
-                        .is_ok()
-                    {
-                        self.discard_failed_create_record(&info.id, &attempt);
-                    } else {
-                        self.failed_create_attempts
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .insert(info.id.clone(), attempt);
-                    }
-                }
-                Ok(_) => {
-                    self.discard_failed_create_record(&info.id, &attempt);
-                }
-                Err(Error::Backend { message, .. }) if message.contains("No such container") => {
-                    self.discard_failed_create_record(&info.id, &attempt);
-                }
-                Err(_) => {
-                    self.failed_create_attempts
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .insert(info.id.clone(), attempt);
-                }
-            }
-            return Err(error);
+        let mut create = ExecRequest::new(argv);
+        create.env.clone_from(&spec.env);
+        if let Err(error) = self.docker_request("create the container", create).await {
+            return Err(self
+                .reconcile_failed_create(&info.id, &attempt, network.is_some(), error)
+                .await);
         }
         self.failed_create_attempts
             .lock()
@@ -512,7 +878,11 @@ impl Sandbox for DockerSandbox {
         // A command that runs and fails is a result, so the raw output is
         // returned rather than being turned into a backend error.
         self.host
-            .run(&ExecRequest::new(args::exec(&self.namespace, id, request)?))
+            .run(&{
+                let mut exec = ExecRequest::new(args::exec(&self.namespace, id, request)?);
+                exec.env.clone_from(&request.env);
+                exec
+            })
             .await
     }
 
@@ -703,7 +1073,11 @@ impl Sandbox for DockerSandbox {
 
     async fn destroy(&self, id: &BoxId) -> Result<()> {
         // Fail on an unknown box before touching Docker.
-        self.store.get(id)?;
+        let info = self.store.get(id)?;
+        let has_egress_network = matches!(info.spec.network, NetworkPolicy::Allowlist(_));
+        if has_egress_network && self.egress_controller.is_none() {
+            return Err(unsupported_egress_policy());
+        }
         let attempt = self
             .failed_create_attempts
             .lock()
@@ -734,6 +1108,9 @@ impl Sandbox for DockerSandbox {
         // recoverable, a container without a record is a leak.
         self.remove_container(args::remove(&self.namespace, id))
             .await?;
+        if has_egress_network {
+            self.cleanup_egress(id).await?;
+        }
         self.mark_observed_box_destroyed(id);
         self.acknowledge_observed_cleanup_for_destroyed_box(id);
         self.store.remove(id)?;
@@ -745,9 +1122,52 @@ impl Sandbox for DockerSandbox {
     }
 }
 
+impl DockerSandbox {
+    async fn rollback_failed_egress_create(
+        &self,
+        id: &BoxId,
+        attempt: &str,
+        error: Error,
+    ) -> Error {
+        match self.cleanup_egress(id).await {
+            Ok(()) => {
+                self.discard_failed_create_record(id, attempt);
+                error
+            }
+            Err(cleanup_error) => {
+                self.failed_create_attempts
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(id.clone(), attempt.to_owned());
+                Error::EgressRollbackFailed {
+                    sandbox: NAME.to_owned(),
+                    message: format!("{error}; cleanup failed: {cleanup_error}"),
+                }
+            }
+        }
+    }
+
+    async fn cleanup_egress(&self, id: &BoxId) -> Result<()> {
+        if let Some(controller) = &self.egress_controller {
+            controller
+                .cleanup(self.host.as_ref(), &self.namespace, id)
+                .await?;
+        }
+        Ok(())
+    }
+}
+
 fn is_name_conflict(error: &Error) -> bool {
     matches!(error, Error::Backend { message, .. }
         if message.contains("container name") && message.contains("already in use"))
+}
+
+fn unsupported_egress_policy() -> Error {
+    Error::ConstraintNotEnforced {
+        sandbox: NAME.to_owned(),
+        constraint: tinybox_core::Constraint::Network,
+        enforcement: tinybox_core::Enforcement::Unsupported,
+    }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {

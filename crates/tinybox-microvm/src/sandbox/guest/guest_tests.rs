@@ -283,3 +283,19 @@ fn the_encoder_round_trips() {
 
     assert_eq!(decode(encoded), "exec 'echo' 'round trip'\n");
 }
+
+#[test]
+fn audit_low4_an_environment_key_that_is_not_a_shell_name_is_refused() {
+    for key in ["X;touch /tmp/pwned;Y", "1X", "A-B", "", "A B"] {
+        let request = ExecRequest::new(["true"]).with_env(key, "v");
+        assert!(
+            matches!(
+                cmdline(&request, SANDBOX),
+                Err(Error::InvalidIdentifier { .. })
+            ),
+            "{key:?} must be refused"
+        );
+    }
+    let request = ExecRequest::new(["true"]).with_env("_OK_1", "v; rm -rf /");
+    assert!(cmdline(&request, SANDBOX).is_ok());
+}

@@ -2,6 +2,12 @@
 use super::*;
 use tinybox_core::MemoryStore;
 use tinybox_core::{ExecOutput as NativeOutput, ExecRequest as NativeRequest, Host};
+async fn wait_for_fixture_signal(signal: &tokio::sync::Notify, name: &'static str) -> Result<()> {
+    tokio::time::timeout(std::time::Duration::from_secs(10), signal.notified())
+        .await
+        .map_err(|_| Error::failed(format!("timed out waiting for fixture signal {name}")))?;
+    Ok(())
+}
 
 #[test]
 fn sandbox_selection_and_spec_mapping_preserve_host_policy() -> Result<()> {
@@ -21,6 +27,15 @@ fn sandbox_selection_and_spec_mapping_preserve_host_policy() -> Result<()> {
         make_sandbox("namespace", host.clone(), store.clone(), "fixture")?
             .local_sandbox
             .is_none()
+    );
+    assert!(
+        make_sandbox("openshell", host.clone(), store.clone(), "fixture")?
+            .local_sandbox
+            .is_none()
+    );
+    assert!(
+        make_sandbox("openshell", host.clone(), store.clone(), "Not_A_Label").is_err(),
+        "an OpenShell namespace must be a DNS label"
     );
     assert!(make_sandbox("unknown", host, store, "fixture").is_err());
 
@@ -69,9 +84,9 @@ fn sandbox_selection_and_spec_mapping_preserve_host_policy() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_create_uses_the_production_host_selection_path() -> Result<()> {
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let id = resources.reserve(ReserveRequest::Resource).await?;
     let info = resources
         .create(CreateRequest {
@@ -87,7 +102,7 @@ async fn local_create_uses_the_production_host_selection_path() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[expect(
     clippy::too_many_lines,
     reason = "one mounted-workspace fixture pins write, read, retry, finalize, and abort semantics together"
@@ -101,7 +116,7 @@ async fn mounted_workspace_files_transfer_in_bounded_atomic_chunks() -> Result<(
     std::fs::write(&destination, b"old")
         .map_err(|error| Error::failed(format!("write fixture file: {error}")))?;
 
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let resource = resources.reserve(ReserveRequest::Resource).await?;
     resources
         .create(CreateRequest {
@@ -246,7 +261,7 @@ async fn mounted_workspace_files_transfer_in_bounded_atomic_chunks() -> Result<(
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[expect(
     clippy::too_many_lines,
     reason = "one resource fixture checks stable rejection behavior across every file-transfer stage"
@@ -256,7 +271,7 @@ async fn file_transfer_retries_and_invalid_requests_have_stable_results() -> Res
         .map_err(|error| Error::failed(format!("create workspace fixture: {error}")))?;
     std::fs::write(workspace.path().join("data.bin"), b"data")
         .map_err(|error| Error::failed(format!("write fixture file: {error}")))?;
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let resource = resources.reserve(ReserveRequest::Resource).await?;
     resources
         .create(CreateRequest {
@@ -390,11 +405,11 @@ fn error_name(error: Option<tinybus::Error>) -> Option<String> {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn file_transfer_capacity_is_reclaimed_and_close_aborts_staging() -> Result<()> {
     let workspace = tempfile::tempdir()
         .map_err(|error| Error::failed(format!("create workspace fixture: {error}")))?;
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let resource = resources.reserve(ReserveRequest::Resource).await?;
     resources
         .create(CreateRequest {
@@ -457,12 +472,12 @@ async fn file_transfer_capacity_is_reclaimed_and_close_aborts_staging() -> Resul
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_file_transfer_refuses_without_an_exec_fallback() -> Result<()> {
     let workspace = tempfile::tempdir()
         .map_err(|error| Error::failed(format!("create workspace fixture: {error}")))?;
     let host = Arc::new(RemoteProcessHost::default());
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let resource = resources.reserve(ReserveRequest::Resource).await?;
     resources
         .create_on(
@@ -500,10 +515,10 @@ async fn remote_file_transfer_refuses_without_an_exec_fallback() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn close_stops_processes_even_when_staged_file_abort_needs_retry() -> Result<()> {
     let host = Arc::new(FileCleanupProcessHost::default());
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let resource = resources.reserve(ReserveRequest::Resource).await?;
     resources
         .create_on(
@@ -562,7 +577,7 @@ async fn close_stops_processes_even_when_staged_file_abort_needs_retry() -> Resu
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_post_allocation_admission_retains_writer_for_close_retry() -> Result<()> {
     use std::future::{Future, poll_fn};
     use std::task::Poll;
@@ -572,7 +587,7 @@ async fn failed_post_allocation_admission_retains_writer_for_close_retry() -> Re
         begin_release: std::sync::Mutex::new(Some(wait)),
         ..Default::default()
     });
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let resource = resources.reserve(ReserveRequest::Resource).await?;
     resources
         .create_on(
@@ -623,13 +638,13 @@ async fn failed_post_allocation_admission_retains_writer_for_close_retry() -> Re
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn finish_rejects_provider_offset_beyond_acknowledged_chunks() -> Result<()> {
     let host = Arc::new(FileCleanupProcessHost {
         finish_offset: Some(99),
         ..Default::default()
     });
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let resource = resources.reserve(ReserveRequest::Resource).await?;
     resources
         .create_on(
@@ -883,10 +898,10 @@ impl Host for FileCleanupProcessHost {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_process_handle_stays_owned_until_the_module_stops_it() -> Result<()> {
     let host = Arc::new(RemoteProcessHost::default());
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let resource = resources.reserve(ReserveRequest::Resource).await?;
     resources
         .create_on(
@@ -939,7 +954,7 @@ async fn remote_process_handle_stays_owned_until_the_module_stops_it() -> Result
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ssh_host_config_uses_the_existing_cli_and_explicit_trust_policy() -> Result<()> {
     let inner = Arc::new(SshArgumentHost::default());
     let host = configured_host(
@@ -1017,11 +1032,11 @@ async fn ssh_host_config_uses_the_existing_cli_and_explicit_trust_policy() -> Re
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn published_port_forward_is_replayed_and_closed_with_its_owner() -> Result<()> {
     let opens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let closes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let id = resources.reserve(ReserveRequest::Resource).await?;
     let created =
         create_forwarding_docker_resource(&resources, id.clone(), &opens, &closes).await?;
@@ -1085,11 +1100,11 @@ async fn published_port_forward_is_replayed_and_closed_with_its_owner() -> Resul
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn forward_replay_is_rejected_after_close_marks_the_resource_closing() -> Result<()> {
     let opens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let closes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let id = resources.reserve(ReserveRequest::Resource).await?;
     create_forwarding_docker_resource(&resources, id.clone(), &opens, &closes).await?;
     let forward = resources
@@ -1173,7 +1188,7 @@ async fn pending_forward_race(shutdown: bool) -> Result<()> {
     let release = Arc::new(tokio::sync::Notify::new());
     let opens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let closes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let resources = Arc::new(Resources::default());
+    let resources = Arc::new(Resources::test_resources());
     let id = resources.reserve(ReserveRequest::Resource).await?;
     resources
         .create_on(
@@ -1241,23 +1256,23 @@ async fn pending_forward_race(shutdown: bool) -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pending_forward_drops_its_tunnel_when_close_marks_resource_closing() -> Result<()> {
     pending_forward_race(false).await
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pending_forward_drops_its_tunnel_when_shutdown_marks_module_closed() -> Result<()> {
     pending_forward_race(true).await
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pending_forward_rechecks_closing_after_host_returns_before_publication() -> Result<()> {
     let entered = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
     let opens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let closes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let resources = Arc::new(Resources::default());
+    let resources = Arc::new(Resources::test_resources());
     let id = resources.reserve(ReserveRequest::Resource).await?;
     resources
         .create_on(
@@ -1312,11 +1327,11 @@ async fn pending_forward_rechecks_closing_after_host_returns_before_publication(
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn forward_rejects_wrong_resource_and_unpublished_port_before_opening() -> Result<()> {
     let opens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let closes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let first = resources.reserve(ReserveRequest::Resource).await?;
     let second = resources.reserve(ReserveRequest::Resource).await?;
     create_forwarding_docker_resource(&resources, first.clone(), &opens, &closes).await?;
@@ -1399,13 +1414,13 @@ async fn create_forwarding_docker_resource(
         .await
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reservation_scope_expiry_sequence_and_pending_limits_fail_without_native_work()
 -> Result<()> {
     let clock = Arc::new(tinybox_core::clock::FixedClock::at_epoch());
     let resources = Resources {
         clock: clock.clone(),
-        ..Resources::default()
+        ..Resources::test_resources()
     };
     assert!(
         resources
@@ -1463,9 +1478,9 @@ async fn reservation_scope_expiry_sequence_and_pending_limits_fail_without_nativ
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn docker_exec_and_detached_processes_use_the_owned_sandbox_lifecycle() -> Result<()> {
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let host = Arc::new(DelayedHost::default());
     host.release.notify_one();
     let id = resources.reserve(ReserveRequest::Resource).await?;
@@ -1514,12 +1529,12 @@ struct FailedDockerStopHost {
     exec_attempts: std::sync::atomic::AtomicUsize,
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn queued_spawn_stays_fenced_after_close_cleanup_fails() -> Result<()> {
     use std::future::{Future, poll_fn};
     use std::task::Poll;
 
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let host = Arc::new(FailedDockerStopHost::default());
     let resource = resources.reserve(ReserveRequest::Resource).await?;
     resources
@@ -1636,9 +1651,9 @@ impl Host for FailedDockerStopHost {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn docker_cancel_retains_process_when_stop_command_fails() -> Result<()> {
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let host = Arc::new(FailedDockerStopHost::default());
     let id = resources.reserve(ReserveRequest::Resource).await?;
     resources
@@ -1728,9 +1743,9 @@ impl Host for LostDockerSpawnReplyHost {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lost_docker_spawn_reply_keeps_reserved_handle_for_cleanup_retry() -> Result<()> {
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let host = Arc::new(LostDockerSpawnReplyHost::default());
     let id = resources.reserve(ReserveRequest::Resource).await?;
     resources
@@ -1867,9 +1882,9 @@ impl Host for LostDockerCreateReplyHost {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn uncertain_docker_create_keeps_named_container_cleanup_retryable() -> Result<()> {
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let host = Arc::new(LostDockerCreateReplyHost::default());
     let id = resources.reserve(ReserveRequest::Resource).await?;
     let created = resources
@@ -1909,10 +1924,10 @@ async fn uncertain_docker_create_keeps_named_container_cleanup_retryable() -> Re
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn create_refuses_backends_missing_from_the_platform_before_owning_a_resource() -> Result<()>
 {
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let host = Arc::new(DelayedHost::default());
     let resource = resources.reserve(ReserveRequest::Resource).await?;
 
@@ -1940,9 +1955,9 @@ async fn create_refuses_backends_missing_from_the_platform_before_owning_a_resou
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn passthrough_create_on_an_unsupervised_platform_only_records_the_resource() -> Result<()> {
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let host = Arc::new(DelayedHost::default());
     let resource = resources.reserve(ReserveRequest::Resource).await?;
 
@@ -1999,9 +2014,9 @@ async fn passthrough_create_on_an_unsupervised_platform_only_records_the_resourc
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn close_fences_process_reservations_before_waiting_for_resource_cleanup() -> Result<()> {
-    let resources = Arc::new(Resources::default());
+    let resources = Arc::new(Resources::test_resources());
     let resource = resources.reserve(ReserveRequest::Resource).await?;
     resources
         .create(CreateRequest {
@@ -2046,9 +2061,9 @@ async fn close_fences_process_reservations_before_waiting_for_resource_cleanup()
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_waits_for_delayed_startups_and_prevents_late_publication() -> Result<()> {
-    let resources = Arc::new(Resources::default());
+    let resources = Arc::new(Resources::test_resources());
     let host = Arc::new(DelayedHost::default());
     let id = resources.reserve(ReserveRequest::Resource).await?;
     let idle = resources.reserve(ReserveRequest::Resource).await?;
@@ -2062,7 +2077,7 @@ async fn shutdown_waits_for_delayed_startups_and_prevents_late_publication() -> 
         ..Default::default()
     };
     let creating = tokio::spawn(async move { runner.create_on(request, native_host).await });
-    host.started.notified().await;
+    wait_for_fixture_signal(&host.started, "delayed create started").await?;
     let process = resources
         .reserve(ReserveRequest::Process(id.clone()))
         .await?;
@@ -2118,10 +2133,10 @@ async fn shutdown_waits_for_delayed_startups_and_prevents_late_publication() -> 
 }
 
 #[cfg(unix)]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelling_a_queued_spawn_prevents_native_start_and_completed_slots_are_reclaimed()
 -> Result<()> {
-    let resources = Arc::new(Resources::default());
+    let resources = Arc::new(Resources::test_resources());
     let id = resources.reserve(ReserveRequest::Resource).await?;
     resources
         .create(CreateRequest {
@@ -2200,7 +2215,7 @@ async fn cancelling_a_queued_spawn_prevents_native_start_and_completed_slots_are
 }
 
 #[cfg(target_os = "linux")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_cancel_and_close_terminate_descendants_and_reap_direct_children() -> Result<()> {
     for mode in [
         "cancel",
@@ -2211,7 +2226,7 @@ async fn native_cancel_and_close_terminate_descendants_and_reap_direct_children(
     ] {
         let directory = tempfile::tempdir().map_err(Error::failed)?;
         let ready = directory.path().join("pids");
-        let resources = Arc::new(Resources::default());
+        let resources = Arc::new(Resources::test_resources());
         let resource = resources.reserve(ReserveRequest::Resource).await?;
         resources
             .create(CreateRequest {
@@ -2301,10 +2316,10 @@ async fn native_cancel_and_close_terminate_descendants_and_reap_direct_children(
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reservations_allow_reordered_acquisition_and_cleanup_only_the_selected_target()
 -> Result<()> {
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let first = resources.reserve(ReserveRequest::Resource).await?;
     let retired = resources.reserve(ReserveRequest::Resource).await?;
     let last = resources.reserve(ReserveRequest::Resource).await?;
@@ -2367,9 +2382,9 @@ async fn reservations_allow_reordered_acquisition_and_cleanup_only_the_selected_
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn repeated_create_close_reclaims_admission_beyond_the_old_lifetime_cap() -> Result<()> {
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     for _ in 0..=tinybox_bus::MAX_RESERVATIONS {
         let resource = resources.reserve(ReserveRequest::Resource).await?;
         resources
@@ -2386,9 +2401,9 @@ async fn repeated_create_close_reclaims_admission_beyond_the_old_lifetime_cap() 
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelled_processes_release_admission_beyond_the_old_retained_cap() -> Result<()> {
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let resource = resources.reserve(ReserveRequest::Resource).await?;
     resources
         .create(CreateRequest {
@@ -2461,9 +2476,9 @@ impl Host for DelayedHost {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn close_during_native_creation_destroys_the_eventual_resource() -> Result<()> {
-    let resources = Arc::new(Resources::default());
+    let resources = Arc::new(Resources::test_resources());
     let host = Arc::new(DelayedHost::default());
     let id = resources.reserve(ReserveRequest::Resource).await?;
     let create_resources = resources.clone();
@@ -2483,7 +2498,7 @@ async fn close_during_native_creation_destroys_the_eventual_resource() -> Result
             )
             .await
     });
-    host.started.notified().await;
+    wait_for_fixture_signal(&host.started, "delayed create started").await?;
     let close_resources = resources.clone();
     let close_id = id.clone();
     let close_started = Arc::new(tokio::sync::Notify::new());
@@ -2492,7 +2507,7 @@ async fn close_during_native_creation_destroys_the_eventual_resource() -> Result
         close_signal.notify_one();
         close_resources.close(&close_id).await
     });
-    close_started.notified().await;
+    wait_for_fixture_signal(&close_started, "close entered").await?;
     assert!(!closing.is_finished());
     assert!(!host.destroyed.load(std::sync::atomic::Ordering::SeqCst));
     host.release.notify_one();
@@ -2503,9 +2518,9 @@ async fn close_during_native_creation_destroys_the_eventual_resource() -> Result
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn close_cancels_owned_native_execution_after_its_waiter_drops() -> Result<()> {
-    let resources = Arc::new(Resources::default());
+    let resources = Arc::new(Resources::test_resources());
     let host = Arc::new(DelayedHost::default());
     let id = resources.reserve(ReserveRequest::Resource).await?;
     host.release.notify_one();
@@ -2531,7 +2546,7 @@ async fn close_cancels_owned_native_execution_after_its_waiter_drops() -> Result
     };
     let native = tokio::spawn(async move { exec_resources.exec(request).await });
     let waiter = tokio::spawn(super::super::finish_operation(native));
-    host.exec_started.notified().await;
+    wait_for_fixture_signal(&host.exec_started, "delayed execution started").await?;
     waiter.abort();
     assert!(waiter.await.is_err());
     let close_resources = resources.clone();
@@ -2542,7 +2557,7 @@ async fn close_cancels_owned_native_execution_after_its_waiter_drops() -> Result
         close_signal.notify_one();
         close_resources.close(&close_id).await
     });
-    close_started.notified().await;
+    wait_for_fixture_signal(&close_started, "close entered").await?;
     assert!(!host.exec_finished.load(std::sync::atomic::Ordering::SeqCst));
     closing.await.map_err(Error::failed)??;
     assert!(!host.exec_finished.load(std::sync::atomic::Ordering::SeqCst));
@@ -2551,12 +2566,13 @@ async fn close_cancels_owned_native_execution_after_its_waiter_drops() -> Result
     Ok(())
 }
 
-#[tokio::test]
-async fn idle_and_active_admission_are_bounded_and_expiry_never_reopens_ids() -> Result<()> {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn idle_and_active_admission_are_bounded_and_expiry_never_reopens_ids()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
     let clock = Arc::new(tinybox_core::clock::FixedClock::at_epoch());
     let resources = Resources {
         clock: clock.clone(),
-        ..Resources::default()
+        ..Resources::test_resources()
     };
     let first = resources.reserve(ReserveRequest::Resource).await?;
     for _ in 1..tinybox_bus::MAX_RESERVATIONS {
@@ -2603,9 +2619,9 @@ async fn idle_and_active_admission_are_bounded_and_expiry_never_reopens_ids() ->
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_pending_create_does_not_block_closing_another_resource() -> Result<()> {
-    let resources = Arc::new(Resources::default());
+    let resources = Arc::new(Resources::test_resources());
     let ready = resources.reserve(ReserveRequest::Resource).await?;
     resources
         .create(CreateRequest {
@@ -2633,7 +2649,7 @@ async fn a_pending_create_does_not_block_closing_another_resource() -> Result<()
             )
             .await
     });
-    host.started.notified().await;
+    wait_for_fixture_signal(&host.started, "delayed create started").await?;
     resources.close(&ready).await?;
     assert!(!pending.is_finished());
     host.release.notify_one();
@@ -2643,9 +2659,9 @@ async fn a_pending_create_does_not_block_closing_another_resource() -> Result<()
 }
 
 #[cfg(unix)]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn process_admission_refuses_overflow_before_native_start() -> Result<()> {
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let id = resources.reserve(ReserveRequest::Resource).await?;
     resources
         .create(CreateRequest {
@@ -2700,11 +2716,11 @@ async fn process_admission_refuses_overflow_before_native_start() -> Result<()> 
 }
 
 #[cfg(unix)]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn close_reaps_a_running_native_exec_before_returning() -> Result<()> {
     let directory = tempfile::tempdir().map_err(Error::failed)?;
     let ready = directory.path().join("ready.pid");
-    let resources = Arc::new(Resources::default());
+    let resources = Arc::new(Resources::test_resources());
     let id = resources.reserve(ReserveRequest::Resource).await?;
     resources
         .create(CreateRequest {
@@ -2751,9 +2767,9 @@ async fn close_reaps_a_running_native_exec_before_returning() -> Result<()> {
 }
 
 #[cfg(unix)]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn module_collection_enforces_output_cap_before_a_reply_is_allocated() -> Result<()> {
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let id = resources.reserve(ReserveRequest::Resource).await?;
     resources
         .create(CreateRequest {
@@ -2782,9 +2798,9 @@ async fn module_collection_enforces_output_cap_before_a_reply_is_allocated() -> 
 }
 
 #[cfg(target_os = "linux")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_drains_other_processes_and_resources_after_a_process_failure() -> Result<()> {
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let directory = tempfile::tempdir().map_err(Error::failed)?;
     let mut ids = Vec::new();
     for _ in 0..2 {
@@ -2891,9 +2907,9 @@ async fn native_ready_pid(ready: &std::path::Path) -> Result<String> {
 }
 
 #[cfg(unix)]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_commands_release_native_slots_through_public_cleanup_retries() -> Result<()> {
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     for index in 0..=tinybox_bus::MAX_ACTIVE_RESOURCES {
         let id = resources.reserve(ReserveRequest::Resource).await?;
         resources
@@ -2944,7 +2960,22 @@ async fn failed_commands_release_native_slots_through_public_cleanup_retries() -
                     assert!(!resources.is_running(&process).await?);
                 }
                 1 => {
-                    assert!(resources.is_running(&process).await.is_err());
+                    let observed_failure =
+                        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                            loop {
+                                match resources.is_running(&process).await {
+                                    Err(_) => return true,
+                                    Ok(false) => return false,
+                                    Ok(true) => tokio::task::yield_now().await,
+                                }
+                            }
+                        })
+                        .await
+                        .map_err(|_| Error::failed("command cleanup did not finish"))?;
+                    assert!(
+                        observed_failure,
+                        "a failed stdin write should be reported before the slot is released"
+                    );
                     assert!(!resources.is_running(&process).await?);
                 }
                 _ => {
@@ -2962,9 +2993,9 @@ async fn failed_commands_release_native_slots_through_public_cleanup_retries() -
 }
 
 #[cfg(unix)]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelling_one_live_execution_does_not_wait_for_another_running_stream() -> Result<()> {
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let resource = resources.reserve(ReserveRequest::Resource).await?;
     resources
         .create(CreateRequest {
@@ -3021,5 +3052,359 @@ async fn cancelling_one_live_execution_does_not_wait_for_another_running_stream(
         first.is_ok_and(|result| result.is_ok()),
         "cancel must acknowledge only its own execution cleanup"
     );
+    Ok(())
+}
+
+/// A stand-in `openshell` CLI: creates and deletes succeed unless told
+/// otherwise, every sandbox reports `Ready`, and exec prints a fixed line.
+#[derive(Debug, Default)]
+struct OpenShellHost {
+    commands: std::sync::Mutex<Vec<Vec<String>>>,
+    fail_create: bool,
+    failed_deletes: std::sync::atomic::AtomicUsize,
+    deletes: std::sync::atomic::AtomicUsize,
+}
+
+impl OpenShellHost {
+    fn ran(&self, verb: &str) -> bool {
+        self.commands
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|argv| argv.get(2).is_some_and(|part| part == verb))
+    }
+}
+
+#[async_trait::async_trait]
+impl Host for OpenShellHost {
+    fn name(&self) -> &'static str {
+        "local"
+    }
+
+    async fn run(&self, request: &NativeRequest) -> tinybox_core::Result<NativeOutput> {
+        self.commands
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(request.argv.clone());
+        Ok(match request.argv.get(2).map(String::as_str) {
+            Some("create") if self.fail_create => {
+                NativeOutput::new(1, Vec::new(), b"timed out waiting for Ready".to_vec())
+            }
+            Some("get") => NativeOutput::new(0, br#"{"phase":"Ready"}"#.to_vec(), Vec::new()),
+            Some("exec") => NativeOutput::new(0, b"hello from openshell\n".to_vec(), Vec::new()),
+            Some("delete") => {
+                self.deletes
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let pending = self
+                    .failed_deletes
+                    .load(std::sync::atomic::Ordering::SeqCst);
+                if pending > 0 {
+                    self.failed_deletes
+                        .store(pending - 1, std::sync::atomic::Ordering::SeqCst);
+                    NativeOutput::new(1, Vec::new(), b"gateway unavailable".to_vec())
+                } else {
+                    NativeOutput::new(0, Vec::new(), Vec::new())
+                }
+            }
+            _ => NativeOutput::new(0, b"{}".to_vec(), Vec::new()),
+        })
+    }
+}
+
+fn openshell_request(resource: &ResourceId) -> CreateRequest {
+    CreateRequest {
+        resource: resource.clone(),
+        backend: "openshell".into(),
+        workspace: Workspace::Image("ghcr.io/example/agent:1".into()),
+        env: BTreeMap::new(),
+        ..Default::default()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn openshell_creates_execs_through_the_owned_collector_and_closes() -> Result<()> {
+    let resources = Resources::test_resources();
+    let host = Arc::new(OpenShellHost::default());
+    let resource = resources.reserve(ReserveRequest::Resource).await?;
+    // Production always passes the owned collector; Exec must accept
+    // OpenShell under it the way it accepts Docker.
+    let collector = Arc::new(tinybox_host::LimitedLocalHost::new(
+        tinybox_bus::MAX_OUTPUT_BYTES,
+    ));
+
+    let created = resources
+        .create_with_platform(
+            openshell_request(&resource),
+            host.clone(),
+            Some(collector),
+            super::super::Platform::Linux,
+        )
+        .await?;
+    assert_eq!(created.backend, "openshell");
+    assert!(host.ran("create"));
+
+    let output = resources
+        .exec(ExecRequest {
+            resource: resource.clone(),
+            argv: vec!["echo".into(), "hello".into()],
+            cwd: None,
+            env: BTreeMap::new(),
+            stdin: None,
+        })
+        .await?;
+    assert_eq!(output.exit_code, 0);
+    assert_eq!(output.stdout, b"hello from openshell\n");
+
+    resources.close(&resource).await?;
+    assert_eq!(host.deletes.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(resources.slot(&resource).await.is_err());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn openshell_refuses_spawn_rather_than_detaching_a_process() -> Result<()> {
+    let resources = Resources::test_resources();
+    let host = Arc::new(OpenShellHost::default());
+    let resource = resources.reserve(ReserveRequest::Resource).await?;
+    resources
+        .create_on_for_platform(
+            openshell_request(&resource),
+            host.clone(),
+            super::super::Platform::Linux,
+        )
+        .await?;
+    let process = resources
+        .reserve(ReserveRequest::Process(resource.clone()))
+        .await?;
+
+    let refused = resources
+        .spawn(SpawnRequest {
+            process,
+            command: ExecRequest {
+                resource: resource.clone(),
+                argv: vec!["sleep".into(), "60".into()],
+                cwd: None,
+                env: BTreeMap::new(),
+                stdin: None,
+            },
+        })
+        .await;
+    assert!(refused.is_err(), "OpenShell declares no detached processes");
+    assert!(
+        !host.ran("exec"),
+        "nothing may run in place of a refused spawn"
+    );
+    resources.close(&resource).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn uncertain_openshell_create_keeps_sandbox_cleanup_retryable() -> Result<()> {
+    let resources = Resources::test_resources();
+    let host = Arc::new(OpenShellHost {
+        fail_create: true,
+        failed_deletes: std::sync::atomic::AtomicUsize::new(1),
+        ..OpenShellHost::default()
+    });
+    let resource = resources.reserve(ReserveRequest::Resource).await?;
+
+    let created = resources
+        .create_on_for_platform(
+            openshell_request(&resource),
+            host.clone(),
+            super::super::Platform::Linux,
+        )
+        .await;
+    assert!(created.is_err(), "the failed create must reach the caller");
+    assert_eq!(host.deletes.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(
+        resources.slot(&resource).await.is_ok(),
+        "module must retain cleanup ownership"
+    );
+
+    resources.close(&resource).await?;
+    assert_eq!(host.deletes.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert!(
+        resources.slot(&resource).await.is_err(),
+        "successful retry releases the slot"
+    );
+    Ok(())
+}
+
+/// Live: an agent37 box runs a command through the **module** path
+/// (`reserve → create → exec → close`), the path a host such as `OpenHuman`
+/// drives over the bus — not `Agent37Sandbox::exec` called directly. This is
+/// the seam the crate-level smoke cannot cover: it crosses the module Exec
+/// guard against the real service. Gated on `AGENT37_API_KEY`; without it the
+/// test is a no-op, so CI stays offline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_agent37_exec_round_trips_through_the_module() -> Result<()> {
+    if std::env::var_os("AGENT37_API_KEY").is_none() {
+        eprintln!(
+            "skipping live_agent37_exec_round_trips_through_the_module: AGENT37_API_KEY unset"
+        );
+        return Ok(());
+    }
+    let resources = Resources::test_resources();
+    let id = resources.reserve(ReserveRequest::Resource).await?;
+    resources
+        .create(CreateRequest {
+            resource: id.clone(),
+            backend: "agent37".into(),
+            workspace: Workspace::Image("agent37-base".into()),
+            network: tinybox_bus::NetworkPolicy::Denied,
+            ..Default::default()
+        })
+        .await?;
+    let output = resources
+        .exec(ExecRequest {
+            resource: id.clone(),
+            argv: vec!["uname".into(), "-s".into()],
+            cwd: None,
+            env: BTreeMap::new(),
+            stdin: None,
+        })
+        .await;
+    // Close the real box before asserting, so a failed exec cannot leak an
+    // instance on the service.
+    let closed = resources.close(&id).await;
+    let output = output?;
+    closed?;
+    assert_eq!(
+        output.exit_code,
+        0,
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !output.stdout.is_empty(),
+        "expected uname output from the agent37 box"
+    );
+    Ok(())
+}
+
+/// A stand-in agent37 sandbox: it reports the agent37 name and returns canned
+/// exec output, so the module Exec guard can be exercised offline (CI has no
+/// `AGENT37_API_KEY`). Only `name`, `capabilities` and `exec` are reached; the
+/// lifecycle methods are never called because the entry is inserted directly.
+#[derive(Debug)]
+struct FakeAgent37Sandbox;
+
+fn agent37_unused(operation: &'static str) -> tinybox_core::Error {
+    tinybox_core::Error::Backend {
+        sandbox: tinybox_agent37::NAME.to_owned(),
+        operation,
+        message: "unused by the exec-guard test".to_owned(),
+    }
+}
+
+#[async_trait::async_trait]
+impl tinybox_core::Sandbox for FakeAgent37Sandbox {
+    fn name(&self) -> &str {
+        tinybox_agent37::NAME
+    }
+
+    fn capabilities(&self) -> tinybox_core::SandboxCapabilities {
+        tinybox_agent37::Agent37Sandbox::declared_capabilities()
+    }
+
+    async fn create(
+        &self,
+        _spec: &tinybox_core::BoxSpec,
+    ) -> tinybox_core::Result<tinybox_core::BoxInfo> {
+        Err(agent37_unused("create"))
+    }
+
+    async fn exec(
+        &self,
+        _id: &tinybox_core::BoxId,
+        _request: &tinybox_core::ExecRequest,
+    ) -> tinybox_core::Result<tinybox_core::ExecOutput> {
+        Ok(tinybox_core::ExecOutput::new(
+            0,
+            b"agent37-offline\n".to_vec(),
+            Vec::new(),
+        ))
+    }
+
+    async fn snapshot(
+        &self,
+        _id: &tinybox_core::BoxId,
+    ) -> tinybox_core::Result<tinybox_core::SnapshotId> {
+        Err(agent37_unused("snapshot"))
+    }
+
+    async fn fork(
+        &self,
+        _snapshot: &tinybox_core::SnapshotId,
+        _spec: &tinybox_core::BoxSpec,
+    ) -> tinybox_core::Result<tinybox_core::BoxInfo> {
+        Err(agent37_unused("fork"))
+    }
+
+    async fn inspect(
+        &self,
+        _id: &tinybox_core::BoxId,
+    ) -> tinybox_core::Result<tinybox_core::BoxInfo> {
+        Err(agent37_unused("inspect"))
+    }
+
+    async fn destroy(&self, _id: &tinybox_core::BoxId) -> tinybox_core::Result<()> {
+        Ok(())
+    }
+}
+
+/// Offline regression for the module Exec guard: an agent37 resource carries a
+/// collector and no local sandbox (`make_sandbox` builds it that way), yet Exec
+/// must be admitted because agent37 runs the command over its own HTTP channel.
+/// Before the guard learned about agent37 this failed with
+/// `UNSUPPORTED_OPERATION: module Exec requires supervised local passthrough
+/// ownership`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent37_exec_is_admitted_through_the_module_guard() -> Result<()> {
+    let resources = Resources::test_resources();
+    let id = resources.reserve(ReserveRequest::Resource).await?;
+    let request = CreateRequest {
+        resource: id.clone(),
+        backend: tinybox_agent37::NAME.into(),
+        workspace: Workspace::Image("agent37-base".into()),
+        network: tinybox_bus::NetworkPolicy::Denied,
+        ..Default::default()
+    };
+    // The exact shape `make_sandbox("agent37", ..)` produces: a collector is
+    // allocated, but there is no owned local passthrough sandbox.
+    let entry = Resource::new(
+        &request,
+        Arc::new(SshArgumentHost::default()),
+        SandboxSelection {
+            sandbox: Arc::new(FakeAgent37Sandbox),
+            docker_sandbox: None,
+            local_sandbox: None,
+        },
+        BoxId::new("agent37-box").map_err(|error| backend_error(&error))?,
+        // agent37 execution does not depend on the local platform, so the module
+        // marks it supported everywhere (`supports_execution`).
+        true,
+        Some(Arc::new(tinybox_host::LimitedLocalHost::new(100))),
+    );
+    resources
+        .state
+        .lock()
+        .await
+        .entries
+        .insert(id.clone(), Arc::new(tokio::sync::Mutex::new(Some(entry))));
+
+    let output = resources
+        .exec(ExecRequest {
+            resource: id.clone(),
+            argv: vec!["uname".into(), "-s".into()],
+            cwd: None,
+            env: BTreeMap::new(),
+            stdin: None,
+        })
+        .await?;
+    assert_eq!(output.exit_code, 0);
+    assert_eq!(output.stdout, b"agent37-offline\n");
+    resources.close(&id).await?;
     Ok(())
 }

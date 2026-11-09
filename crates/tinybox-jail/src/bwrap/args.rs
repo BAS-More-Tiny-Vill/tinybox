@@ -304,17 +304,10 @@ fn deny_masks(denied: &[PathBuf], mounts: &[Mount]) -> io::Result<Vec<OsString>>
         else {
             continue;
         };
-        if holder.writable() && deny.parent() != Some(holder.path.as_path()) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "deny_read {} is nested inside writable grant {}; the child could rename \
-                     a parent directory and bypass the mask (deny a direct child of the grant, \
-                     or make the grant read-only)",
-                    deny.display(),
-                    holder.path.display()
-                ),
-            ));
+        if holder.writable()
+            && let Some(error) = crate::jail::nested_denial(deny, &holder.path)
+        {
+            return Err(error);
         }
         match std::fs::metadata(deny) {
             Ok(meta) if meta.is_dir() => {
@@ -325,9 +318,10 @@ fn deny_masks(denied: &[PathBuf], mounts: &[Mount]) -> io::Result<Vec<OsString>>
                 os("/dev/null"),
                 deny.clone().into_os_string(),
             ]),
-            // Bubblewrap creates a missing --tmpfs destination on the host
-            // before mounting over it. Refuse instead of mutating a granted
-            // directory or preventing a future file from being created there.
+            // Bubblewrap's `--tmpfs` creates a missing destination on the host
+            // before mounting it. Refuse prospective denials rather than
+            // mutating a granted host directory or preventing that path from
+            // later being created as a file.
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
