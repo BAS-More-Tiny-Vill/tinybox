@@ -2,3 +2,4 @@
 # to check that the bubblewrap jail strips the environment (crates/tinybox-jail/tests/bwrap_isolation.rs).
 9c5630ba45249d494347a646ea745e1f2922c590:crates/tinybox-jail/tests/bwrap_isolation.rs:generic-api-key:404
 8cff8b260bae79bb2f8bbe1610e180ded327cf80:crates/tinybox-jail/tests/bwrap_isolation.rs:generic-api-key:370
+320c14f55d140bc85763e25dfa326e0f6a7e0c4e:crates/tinybox-jail/tests/bwrap_isolation.rs:generic-api-key:404
