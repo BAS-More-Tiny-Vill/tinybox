@@ -579,6 +579,7 @@ fn capabilities_for(platform: Platform) -> tinybox_bus::ModuleCapabilities {
         create_backends,
         exec_backends,
         spawn_backends: supervised,
+        features: docker::advertised_features(),
     }
 }
 

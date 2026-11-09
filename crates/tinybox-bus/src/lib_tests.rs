@@ -165,6 +165,7 @@ fn version_and_capability_wire_snapshot_preserve_contract_compatibility()
         create_backends: vec!["passthrough".into()],
         exec_backends: Vec::new(),
         spawn_backends: Vec::new(),
+        features: Vec::new(),
     };
     let snapshot = serde_json::json!({"contract_version":[2,3],"create_backends":["passthrough"],"exec_backends":[],"spawn_backends":[]});
     assert_eq!(serde_json::to_value(&capabilities)?, snapshot);
@@ -518,4 +519,170 @@ fn docker_cleanup_evidence_is_optional_on_old_wire_results() -> Result<(), serde
     assert_eq!(result.killed, Some(false));
     assert_eq!(result.duration_ms, Some(27));
     Ok(())
+}
+
+// ---- Codex P1 on PR #18: the hardened Docker run is an explicit capability ----
+
+fn old_module_capabilities() -> Result<ModuleCapabilities, serde_json::Error> {
+    // A contract 2.3 module built without the fork Docker hardening (for
+    // example unmodified upstream) describes itself without `features`.
+    serde_json::from_value(serde_json::json!({
+        "contract_version": [2, 3],
+        "create_backends": ["passthrough", "docker"],
+        "exec_backends": ["passthrough", "docker"],
+        "spawn_backends": ["passthrough", "docker"]
+    }))
+}
+
+#[test]
+fn hardened_docker_run_is_advertised_as_a_capability_not_a_version() -> Result<(), serde_json::Error>
+{
+    assert_eq!(HARDENED_DOCKER_RUN_FEATURE, "docker-run-hardened-v1");
+    let old = old_module_capabilities()?;
+    assert!(old.features.is_empty());
+    // The version check alone cannot tell the two modules apart.
+    assert!(is_compatible(old.contract_version));
+    assert!(!supports_hardened_docker_run(&old));
+
+    let mut hardened = old.clone();
+    hardened.features.push(HARDENED_DOCKER_RUN_FEATURE.into());
+    assert!(is_compatible(hardened.contract_version));
+    assert!(supports_hardened_docker_run(&hardened));
+    let wire = serde_json::to_value(&hardened)?;
+    assert_eq!(
+        wire["features"],
+        serde_json::json!(["docker-run-hardened-v1"])
+    );
+    assert_eq!(
+        serde_json::from_value::<ModuleCapabilities>(wire)?,
+        hardened
+    );
+
+    // Only the exact capability counts, and only from a compatible major.
+    let mut other = old.clone();
+    other.features.push("docker-run-hardened-v2".into());
+    assert!(!supports_hardened_docker_run(&other));
+    let mut wrong_major = hardened.clone();
+    wrong_major.contract_version = (3, 0);
+    assert!(!supports_hardened_docker_run(&wrong_major));
+    Ok(())
+}
+
+#[test]
+fn docker_run_requests_with_user_or_pids_limit_need_the_hardened_capability()
+-> Result<(), serde_json::Error> {
+    let old = old_module_capabilities()?;
+    let mut hardened = old.clone();
+    hardened.features.push(HARDENED_DOCKER_RUN_FEATURE.into());
+
+    let plain: DockerRunRequest = serde_json::from_str(r#"{"workspace":"/w","command":"true"}"#)?;
+    assert!(!plain.requests_hardened_limits());
+    assert!(docker_run_request_is_supported(&old, &plain));
+    assert!(docker_run_request_is_supported(&hardened, &plain));
+
+    let mut with_user = plain.clone();
+    with_user.user = Some("1000:1000".into());
+    let mut with_pids = plain.clone();
+    with_pids.pids_limit = Some(64);
+    for request in [&with_user, &with_pids] {
+        assert!(request.requests_hardened_limits());
+        // An old module would ignore the unknown fields and run with its old
+        // behaviour, so the host must not send this request to it.
+        assert!(!docker_run_request_is_supported(&old, request));
+        assert!(docker_run_request_is_supported(&hardened, request));
+    }
+    Ok(())
+}
+
+// ---- Round 2 on PR #18: the floor holds on every run, and refusals are distinct ----
+
+#[test]
+fn a_host_that_requires_the_floor_checks_the_capability_for_every_request()
+-> Result<(), serde_json::Error> {
+    let old = old_module_capabilities()?;
+    let mut hardened = old.clone();
+    hardened.features.push(HARDENED_DOCKER_RUN_FEATURE.into());
+    let plain: DockerRunRequest = serde_json::from_str(r#"{"workspace":"/w","command":"true"}"#)?;
+    let mut with_pids = plain.clone();
+    with_pids.pids_limit = Some(64);
+
+    // `WhenRequested` is exactly `docker_run_request_is_supported`.
+    for request in [&plain, &with_pids] {
+        for capabilities in [&old, &hardened] {
+            assert_eq!(
+                docker_run_request_is_supported_with_policy(
+                    capabilities,
+                    request,
+                    HardenedDockerRunPolicy::WhenRequested
+                ),
+                docker_run_request_is_supported(capabilities, request)
+            );
+        }
+    }
+    // `Always`: an old module is refused even for a plain request, because it
+    // would run it without the non-root identity and process cap floor.
+    assert!(!docker_run_request_is_supported_with_policy(
+        &old,
+        &plain,
+        HardenedDockerRunPolicy::Always
+    ));
+    assert!(!docker_run_request_is_supported_with_policy(
+        &old,
+        &with_pids,
+        HardenedDockerRunPolicy::Always
+    ));
+    assert!(docker_run_request_is_supported_with_policy(
+        &hardened,
+        &plain,
+        HardenedDockerRunPolicy::Always
+    ));
+    assert!(docker_run_request_is_supported_with_policy(
+        &hardened,
+        &with_pids,
+        HardenedDockerRunPolicy::Always
+    ));
+    assert_eq!(
+        HardenedDockerRunPolicy::default(),
+        HardenedDockerRunPolicy::WhenRequested
+    );
+    Ok(())
+}
+
+#[test]
+fn module_capabilities_default_supports_struct_update_syntax() -> Result<(), serde_json::Error> {
+    // `features` is a public-field addition: downstream struct literals keep
+    // compiling with `..Default::default()`.
+    let capabilities = ModuleCapabilities {
+        contract_version: CONTRACT_VERSION,
+        create_backends: vec!["passthrough".into()],
+        ..Default::default()
+    };
+    assert!(capabilities.features.is_empty());
+    assert!(capabilities.exec_backends.is_empty());
+    assert!(!supports_hardened_docker_run(&capabilities));
+    // The default claims no contract version and no capability.
+    let empty = ModuleCapabilities::default();
+    assert_eq!(empty.contract_version, (0, 0));
+    assert!(!is_compatible(empty.contract_version));
+    assert!(!supports_hardened_docker_run(&empty));
+    assert_eq!(
+        serde_json::from_value::<ModuleCapabilities>(serde_json::to_value(&capabilities)?)?,
+        capabilities
+    );
+    Ok(())
+}
+
+#[test]
+fn an_enforcement_refusal_has_its_own_stable_error_name() {
+    assert_eq!(
+        DOCKER_LIMITS_UNENFORCEABLE,
+        "ai.tinyhumans.tinybox.Error.DockerLimitsUnenforceable"
+    );
+    for other in [
+        INVALID_DOCKER_RUN,
+        INVALID_DOCKER_CONTROL,
+        DOCKER_CONTROL_FAILED,
+    ] {
+        assert_ne!(DOCKER_LIMITS_UNENFORCEABLE, other);
+    }
 }

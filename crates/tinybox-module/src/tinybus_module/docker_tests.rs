@@ -77,6 +77,25 @@ fn canonical(path: &Path) -> std::io::Result<String> {
     path.canonicalize().map(|path| path.display().to_string())
 }
 
+/// A fake CLI body for the always-verified run: `info` reports a daemon that
+/// enforces limits, `create` records its argv (NUL separated) into
+/// `argv_file`, and copies any `--env-file` it was given to `<argv_file>.env`
+/// (the module deletes its own copy once `create` has read it), `inspect`
+/// prints `inspect`, and `start` prints `out` / `err` and exits with
+/// `exit_code`.
+fn settings_cli_script(argv_file: &Path, inspect: &str, exit_code: i32) -> String {
+    format!(
+        "#!/bin/sh\ncase \"$1\" in\n\
+         info) echo '{ENFORCING_INFO}';;\n\
+         create) : > '{argv}'; prev=; for a in \"$@\"; do printf '%s\\0' \"$a\" >> '{argv}'; [ \"$prev\" = --env-file ] && cp \"$a\" '{argv}.env'; prev=$a; done; echo cid-7;;\n\
+         inspect) echo '{inspect}';;\n\
+         start) printf out; printf err >&2; exit {exit_code};;\n\
+         *) exit 9;;\n\
+         esac\n",
+        argv = argv_file.display(),
+    )
+}
+
 fn has_pair(argv: &[String], flag: &str, value: &str) -> bool {
     argv.windows(2)
         .any(|pair| pair[0] == flag && pair[1] == value)
@@ -153,7 +172,8 @@ async fn docker_cleanup_only_kills_ids_returned_for_the_requested_label()
     assert_eq!(result.containers_stopped, 2);
     assert_eq!(
         std::fs::read_to_string(calls)?,
-        "ps -q --filter label=openhuman.sandbox=true\nkill box-a box-b\n"
+        // Round 2: `-a` also lists created-but-never-started containers.
+        "ps -aq --filter label=openhuman.sandbox=true\nkill box-a box-b\n"
     );
     Ok(())
 }
@@ -217,7 +237,7 @@ async fn docker_cleanup_does_not_kill_ids_from_a_failed_listing()
     assert_eq!(error.wire_name(), tinybox_bus::DOCKER_CONTROL_FAILED);
     assert_eq!(
         std::fs::read_to_string(calls)?,
-        "ps -q --filter label=openhuman.sandbox=true\n"
+        "ps -aq --filter label=openhuman.sandbox=true\n"
     );
     Ok(())
 }
@@ -248,7 +268,7 @@ async fn docker_cleanup_with_no_matching_containers_does_not_kill()
     assert_eq!(result.containers_stopped, 0);
     assert_eq!(
         std::fs::read_to_string(calls)?,
-        "ps -q --filter label=openhuman.sandbox=true\n"
+        "ps -aq --filter label=openhuman.sandbox=true\n"
     );
     Ok(())
 }
@@ -311,13 +331,13 @@ async fn run_docker_preserves_one_shot_settings_output_and_timeout()
     std::fs::create_dir_all(&readonly)?;
     let argv_file = temp.path().join("argv.bin");
     let script_path = temp.path().join("docker");
+    // Round 2 (always verify): this fake used to answer a single `docker run`;
+    // every run is now probed, created, read back and started, so it answers
+    // each step and records `create`'s argv (which carries every setting).
+    let user = default_user(Some(&workspace))?;
     write_cli_fixture(
         &script_path,
-        format!(
-            "#!/bin/sh\n: > '{}'\nfor a in \"$@\"; do printf '%s\\0' \"$a\" >> '{}'; done\nprintf out\nprintf err >&2\nexit 3\n",
-            argv_file.display(),
-            argv_file.display(),
-        ),
+        settings_cli_script(&argv_file, &format!("2147483648 256 {user}"), 3),
     )?;
 
     let request = DockerRunRequest {
@@ -348,12 +368,19 @@ async fn run_docker_preserves_one_shot_settings_output_and_timeout()
     assert!(!output.timed_out);
     assert_eq!(output.killed, None);
     assert!(output.duration_ms.is_some());
+    assert_eq!(
+        output.observed_limits,
+        Some(tinybox_bus::DockerObservedLimits {
+            memory_bytes: 2048 * 1024 * 1024,
+            pids_limit: Some(256),
+            user: user.clone(),
+        })
+    );
 
-    let argv: Vec<String> = std::fs::read(&argv_file)?
-        .split(|byte| *byte == 0)
-        .filter(|part| !part.is_empty())
-        .map(|part| String::from_utf8_lossy(part).into_owned())
-        .collect();
+    let argv = create_argv(&argv_file)?;
+    assert_eq!(argv[0], "create", "{argv:?}");
+    assert!(has_pair(&argv, "--user", &user), "{argv:?}");
+    assert!(has_pair(&argv, "--pids-limit", "256"), "{argv:?}");
     assert!(has_pair(&argv, "--network", "bridge"));
     assert!(has_pair(&argv, "--cap-drop", "NET_RAW"));
     assert!(has_pair(&argv, "--cap-drop", "MKNOD"));
@@ -365,11 +392,35 @@ async fn run_docker_preserves_one_shot_settings_output_and_timeout()
         "-v",
         &format!("{}:{}:ro", canonical(&readonly)?, canonical(&readonly)?)
     ));
-    assert!(has_pair(&argv, "-e", "MODE"));
-    assert!(has_pair(&argv, "-e", "SPACE"));
+    // Round 2 (env-file): the environment used to be named with `-e NAME` and
+    // passed through the client's own environment. It now reaches only the
+    // container through `--env-file`; neither names nor values sit on argv.
+    assert_env_only_in_env_file(&argv, &argv_file, "MODE=test\nSPACE=a b\n")?;
     assert!(!argv.iter().any(|argument| argument.contains("a b")));
     assert!(has_pair(&argv, "--label", "openhuman.sandbox=true"));
     assert!(has_pair(&argv, "-w", "/workspace"));
+    Ok(())
+}
+
+/// The create argv passes exactly one `--env-file`, never `-e`, and the file
+/// Docker read held `expected`.
+fn assert_env_only_in_env_file(
+    argv: &[String],
+    argv_file: &Path,
+    expected: &str,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    assert!(!argv.iter().any(|argument| argument == "-e"), "{argv:?}");
+    assert_eq!(
+        argv.iter()
+            .filter(|argument| *argument == "--env-file")
+            .count(),
+        1,
+        "{argv:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(argv_file.with_extension("bin.env"))?,
+        expected
+    );
     Ok(())
 }
 
@@ -379,13 +430,10 @@ async fn run_without_workspace_preserves_docker_settings_without_host_mounts()
     let temp = tempfile::tempdir()?;
     let argv_file = temp.path().join("argv.bin");
     let script_path = temp.path().join("docker");
+    // Round 2 (always verify): see `run_docker_preserves_one_shot_settings_output_and_timeout`.
     write_cli_fixture(
         &script_path,
-        format!(
-            "#!/bin/sh\n: > '{}'\nfor a in \"$@\"; do printf '%s\\0' \"$a\" >> '{}'; done\nprintf out\nprintf err >&2\nexit 0\n",
-            argv_file.display(),
-            argv_file.display(),
-        ),
+        settings_cli_script(&argv_file, "1610612736 256 65534:65534", 0),
     )?;
 
     let request = DockerRunRequest {
@@ -412,17 +460,24 @@ async fn run_without_workspace_preserves_docker_settings_without_host_mounts()
     assert!(!output.timed_out);
     assert_eq!(output.killed, None);
     assert!(output.duration_ms.is_some());
+    assert_eq!(
+        output.observed_limits,
+        Some(tinybox_bus::DockerObservedLimits {
+            memory_bytes: 1536 * 1024 * 1024,
+            pids_limit: Some(256),
+            user: "65534:65534".into(),
+        })
+    );
 
-    let argv: Vec<String> = std::fs::read(&argv_file)?
-        .split(|byte| *byte == 0)
-        .filter(|part| !part.is_empty())
-        .map(|part| String::from_utf8_lossy(part).into_owned())
-        .collect();
+    let argv = create_argv(&argv_file)?;
+    assert_eq!(argv[0], "create", "{argv:?}");
+    assert!(has_pair(&argv, "--user", "65534:65534"), "{argv:?}");
     assert!(has_pair(&argv, "--network", "bridge"));
     assert!(has_pair(&argv, "-m", "1536m"));
     assert!(has_pair(&argv, "--cpus", "1.5"));
     assert!(has_pair(&argv, "--cap-drop", "NET_RAW"));
-    assert!(has_pair(&argv, "-e", "MODE"));
+    // Round 2 (env-file): see `run_docker_preserves_one_shot_settings_output_and_timeout`.
+    assert_env_only_in_env_file(&argv, &argv_file, "MODE=preserved\n")?;
     assert!(!argv.iter().any(|argument| argument.contains("preserved")));
     assert!(has_pair(&argv, "--label", "openhuman.sandbox=true"));
     assert!(!argv.iter().any(|argument| argument == "-v"));
@@ -554,11 +609,29 @@ fn workspace_less_run_still_refuses_host_network() {
 
 // ---- DEF-32: --user, --pids-limit, and the read-back reported to the host ----
 
+/// What a daemon that enforces memory and process limits reports for
+/// `docker info --format '{{json .}}'` (the fields the probe reads).
+const ENFORCING_INFO: &str = r#"{"MemoryLimit":true,"PidsLimit":true,"SwapLimit":true,"CgroupVersion":"2","CgroupDriver":"systemd","SecurityOptions":["name=seccomp,profile=builtin","name=cgroupns"]}"#;
+
+/// The same daemon without the pids controller: `--pids-limit` is stored but
+/// not enforced, so every run must be refused before anything is created.
+const NO_PIDS_INFO: &str = r#"{"MemoryLimit":true,"PidsLimit":false,"SwapLimit":true,"CgroupVersion":"2","CgroupDriver":"systemd","SecurityOptions":["name=seccomp,profile=builtin","name=cgroupns"]}"#;
+
 /// A fake CLI for the verified path: records `create`'s argv (NUL separated)
-/// and every call, and answers `inspect` with `inspect`.
+/// and every call, answers `info` with a daemon that enforces limits, and
+/// answers `inspect` with `inspect`.
 fn verified_cli(
     dir: &Path,
     inspect: &str,
+) -> std::io::Result<(DockerCli, std::path::PathBuf, std::path::PathBuf)> {
+    verified_cli_with_info(dir, inspect, &format!("echo '{ENFORCING_INFO}'"))
+}
+
+/// [`verified_cli`] with `info_arm` as the shell body of the `info` answer.
+fn verified_cli_with_info(
+    dir: &Path,
+    inspect: &str,
+    info_arm: &str,
 ) -> std::io::Result<(DockerCli, std::path::PathBuf, std::path::PathBuf)> {
     let argv_file = dir.join("create.bin");
     let calls = dir.join("calls");
@@ -567,6 +640,7 @@ fn verified_cli(
         &script_path,
         format!(
             "#!/bin/sh\necho \"$1\" >> '{calls}'\ncase \"$1\" in\n\
+             info) {info_arm};;\n\
              create) : > '{argv}'; for a in \"$@\"; do printf '%s\\0' \"$a\" >> '{argv}'; done; echo cid-9;;\n\
              inspect) echo '{inspect}';;\n\
              start) printf out; printf err >&2; exit 4;;\n\
@@ -576,6 +650,29 @@ fn verified_cli(
         ),
     )?;
     Ok((DockerCli::with_program(&script_path), argv_file, calls))
+}
+
+/// The module's default identity for `workspace`: its non-root owner, else
+/// `65534:65534` (also the identity for runs without a workspace).
+fn default_user(workspace: Option<&Path>) -> std::io::Result<String> {
+    use std::os::unix::fs::MetadataExt;
+    let Some(workspace) = workspace else {
+        return Ok("65534:65534".to_owned());
+    };
+    let metadata = std::fs::metadata(workspace)?;
+    Ok(if metadata.uid() == 0 {
+        "65534:65534".to_owned()
+    } else {
+        format!("{}:{}", metadata.uid(), metadata.gid())
+    })
+}
+
+fn create_argv(argv_file: &Path) -> std::io::Result<Vec<String>> {
+    Ok(std::fs::read(argv_file)?
+        .split(|byte| *byte == 0)
+        .filter(|part| !part.is_empty())
+        .map(|part| String::from_utf8_lossy(part).into_owned())
+        .collect())
 }
 
 fn hardened_request(workspace: &Path) -> DockerRunRequest {
@@ -611,7 +708,10 @@ async fn def32_user_and_pids_limit_reach_the_container_and_are_read_back()
     assert_eq!(argv[0], "create");
     assert!(has_pair(&argv, "--user", "1000:1000"), "{argv:?}");
     assert!(has_pair(&argv, "--pids-limit", "256"), "{argv:?}");
-    assert_eq!(std::fs::read_to_string(&calls)?, "create\ninspect\nstart\n");
+    assert_eq!(
+        std::fs::read_to_string(&calls)?,
+        "info\ncreate\ninspect\nstart\n"
+    );
     Ok(())
 }
 
@@ -625,20 +725,123 @@ async fn def32_a_run_whose_limits_are_not_in_force_never_starts()
         .err()
         .ok_or("a run without its limits in force must fail")?;
     assert_eq!(error.wire_name(), tinybox_bus::INVALID_DOCKER_RUN);
-    assert_eq!(std::fs::read_to_string(&calls)?, "create\ninspect\nrm\n");
+    assert_eq!(
+        std::fs::read_to_string(&calls)?,
+        "info\ncreate\ninspect\nrm\n"
+    );
+    Ok(())
+}
+
+// Round 2 (always verify): this test used to assert that a request without
+// `user` / `pids_limit` took the plain `docker run` path and reported no
+// read-back. Every run is now probed and read back, so it asserts the opposite.
+#[tokio::test]
+async fn def32_requests_without_user_or_pids_are_verified_and_report_the_default_read_back()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let user = default_user(Some(temp.path()))?;
+    let (cli, argv_file, calls) = verified_cli(temp.path(), &format!("536870912 256 {user}"))?;
+    let mut request = policy_request(None, &[], &temp.path().display().to_string());
+    request.timeout_ms = 20_000;
+    let output = run_with_cli(&cli, request, true).await?;
+    assert_eq!(
+        output.observed_limits,
+        Some(tinybox_bus::DockerObservedLimits {
+            memory_bytes: 536_870_912,
+            pids_limit: Some(256),
+            user: user.clone(),
+        })
+    );
+    assert_eq!(output.exit_code, 4);
+    let argv = create_argv(&argv_file)?;
+    assert!(has_pair(&argv, "--user", &user), "{argv:?}");
+    assert!(has_pair(&argv, "--pids-limit", "256"), "{argv:?}");
+    assert_eq!(
+        std::fs::read_to_string(&calls)?,
+        "info\ncreate\ninspect\nstart\n"
+    );
     Ok(())
 }
 
 #[tokio::test]
-async fn def32_requests_without_user_or_pids_keep_the_plain_run_and_report_no_read_back()
+async fn round2_enforcement_refusal_has_its_own_error_and_creates_nothing()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
     let temp = tempfile::tempdir()?;
-    let (cli, _, calls) = verified_cli(temp.path(), "unused")?;
-    let mut request = policy_request(None, &[], &temp.path().display().to_string());
-    request.timeout_ms = 20_000;
-    let output = run_with_cli(&cli, request, true).await?;
-    assert_eq!(output.observed_limits, None);
-    assert_eq!(std::fs::read_to_string(&calls)?, "run\n");
+    let (cli, _, calls) = verified_cli_with_info(
+        temp.path(),
+        "536870912 256 1000:1000",
+        &format!("echo '{NO_PIDS_INFO}'"),
+    )?;
+    let error = run_with_cli(&cli, hardened_request(temp.path()), true)
+        .await
+        .err()
+        .ok_or("a daemon without the pids controller must refuse the run")?;
+    assert_eq!(
+        error.wire_name(),
+        tinybox_bus::DOCKER_LIMITS_UNENFORCEABLE,
+        "{error:?}"
+    );
+    assert_ne!(
+        tinybox_bus::DOCKER_LIMITS_UNENFORCEABLE,
+        tinybox_bus::INVALID_DOCKER_RUN
+    );
+    assert!(error.to_string().contains("PidsLimit=false"), "{error}");
+    // Refused before anything was created: nothing to remove, nothing started.
+    assert_eq!(std::fs::read_to_string(&calls)?, "info\n");
+
+    // A plain request is refused the same way: the floor applies to every run.
+    std::fs::remove_file(&calls)?;
+    let mut plain = policy_request(None, &[], &temp.path().display().to_string());
+    plain.timeout_ms = 20_000;
+    let error = run_with_cli(&cli, plain, true)
+        .await
+        .err()
+        .ok_or("the process floor must be enforceable for plain runs too")?;
+    assert_eq!(error.wire_name(), tinybox_bus::DOCKER_LIMITS_UNENFORCEABLE);
+    assert_eq!(std::fs::read_to_string(&calls)?, "info\n");
+    Ok(())
+}
+
+#[tokio::test]
+async fn round2_a_failed_or_slow_probe_is_not_reported_as_an_enforcement_refusal()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    // A probe that fails is a verification failure, not a refusal.
+    let temp = tempfile::tempdir()?;
+    let (cli, _, calls) =
+        verified_cli_with_info(temp.path(), "unused", "echo daemon down >&2; exit 1")?;
+    let error = run_with_cli(&cli, hardened_request(temp.path()), true)
+        .await
+        .err()
+        .ok_or("a failed probe must refuse the run")?;
+    assert_eq!(
+        error.wire_name(),
+        tinybox_bus::INVALID_DOCKER_RUN,
+        "{error:?}"
+    );
+    assert!(
+        error.to_string().contains("could not be verified"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read_to_string(&calls)?, "info\n");
+
+    // A probe that overruns the deadline is reported as a deadline, not a refusal.
+    let slow = tempfile::tempdir()?;
+    let (cli, _, _) = verified_cli_with_info(slow.path(), "unused", "exec sleep 10")?;
+    let mut request = hardened_request(slow.path());
+    request.timeout_ms = 300;
+    let error = run_with_cli(&cli, request, true)
+        .await
+        .err()
+        .ok_or("a probe past the deadline must refuse the run")?;
+    assert_eq!(
+        error.wire_name(),
+        tinybox_bus::INVALID_DOCKER_RUN,
+        "{error:?}"
+    );
+    assert!(
+        error.to_string().contains("exceeded its deadline"),
+        "{error}"
+    );
     Ok(())
 }
 
@@ -733,6 +936,104 @@ async fn merge_an_explicit_pids_limit_alone_reads_back_the_default_user()
     assert!(argv[3].starts_with("tinybox-"), "{argv:?}");
     assert!(has_pair(&argv, "--user", &user), "{argv:?}");
     assert!(has_pair(&argv, "--pids-limit", "64"), "{argv:?}");
-    assert_eq!(std::fs::read_to_string(&calls)?, "create\ninspect\nstart\n");
+    assert_eq!(
+        std::fs::read_to_string(&calls)?,
+        "info\ncreate\ninspect\nstart\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn round2_explicit_user_refuses_gid_0_and_memory_limit_refuses_0() {
+    let with = |user: Option<&str>, memory: Option<u64>| {
+        let mut request = policy_request(None, &[], "/work");
+        request.user = user.map(str::to_owned);
+        request.memory_limit_mb = memory;
+        validate(&request, true)
+    };
+    for root_group in ["1000:0", "1000:00", "65534:0"] {
+        assert!(
+            matches!(with(Some(root_group), None), Err(e) if e.wire_name() == tinybox_bus::INVALID_DOCKER_RUN),
+            "{root_group}"
+        );
+    }
+    assert!(with(Some("1000:1"), None).is_ok());
+    assert!(matches!(
+        with(None, Some(0)),
+        Err(e) if e.wire_name() == tinybox_bus::INVALID_DOCKER_RUN
+    ));
+    assert!(with(None, Some(1)).is_ok());
+    assert!(with(None, None).is_ok());
+}
+
+// ---- Codex P1 on PR #18: the module advertises the hardened Docker run ----
+
+#[test]
+fn module_advertises_the_hardened_docker_run_capability() {
+    for platform in [
+        super::super::Platform::Linux,
+        super::super::Platform::Unix,
+        super::super::Platform::Windows,
+        super::super::Platform::Other,
+    ] {
+        let capabilities = super::super::capabilities_for(platform);
+        assert!(
+            tinybox_bus::supports_hardened_docker_run(&capabilities),
+            "{capabilities:?}"
+        );
+        assert_eq!(
+            capabilities.features,
+            vec![tinybox_bus::HARDENED_DOCKER_RUN_FEATURE.to_owned()]
+        );
+        // Round 2: the floor holds on every run, so a host that requires it
+        // may send this module plain requests too.
+        assert!(tinybox_bus::docker_run_request_is_supported_with_policy(
+            &capabilities,
+            &policy_request(None, &[], "/work"),
+            tinybox_bus::HardenedDockerRunPolicy::Always,
+        ));
+    }
+}
+
+#[tokio::test]
+async fn hardened_request_round_trips_to_the_module_and_reports_observed_limits()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    // The host reads the module description off the wire and checks the
+    // capability before it sends user / pids_limit.
+    let capabilities: tinybox_bus::ModuleCapabilities =
+        serde_json::from_value(serde_json::to_value(super::super::capabilities_for(
+            super::super::Platform::current(),
+        ))?)?;
+    let temp = tempfile::tempdir()?;
+    let mut sent = hardened_request(temp.path());
+    sent.pids_limit = Some(64);
+    assert!(tinybox_bus::docker_run_request_is_supported(
+        &capabilities,
+        &sent
+    ));
+
+    let received: DockerRunRequest = serde_json::from_value(serde_json::to_value(&sent)?)?;
+    assert_eq!(received.user.as_deref(), Some("1000:1000"));
+    assert_eq!(received.pids_limit, Some(64));
+
+    let (cli, argv_file, _) = verified_cli(temp.path(), "536870912 64 1000:1000")?;
+    let output = run_with_cli(&cli, received, true).await?;
+    let returned: tinybox_bus::DockerRunOutput =
+        serde_json::from_value(serde_json::to_value(&output)?)?;
+    assert_eq!(
+        returned.observed_limits,
+        Some(tinybox_bus::DockerObservedLimits {
+            memory_bytes: 536_870_912,
+            pids_limit: Some(64),
+            user: "1000:1000".into(),
+        })
+    );
+    let argv: Vec<String> = std::fs::read(&argv_file)?
+        .split(|byte| *byte == 0)
+        .filter(|part| !part.is_empty())
+        .map(|part| String::from_utf8_lossy(part).into_owned())
+        .collect();
+    assert!(has_pair(&argv, "--user", "1000:1000"), "{argv:?}");
+    assert!(has_pair(&argv, "--pids-limit", "64"), "{argv:?}");
     Ok(())
 }

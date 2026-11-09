@@ -1,14 +1,45 @@
 #!/bin/sh
 # Local Docker CLI fixture: no daemon or container isolation is claimed.
+# One-shot runs are always verified (probe, create, read back, start), so the
+# fixture answers that lifecycle too. It keeps no state: create encodes the
+# limits it was given into the container id, and inspect decodes them.
 operation=$1
 shift
 case "$operation" in
-  info) printf 'fixture-engine\n' ;;
+  info)
+    if [ "$1" = --format ]; then
+      printf '%s\n' '{"ID":"fixture-engine","ServerVersion":"27.5.1","MemoryLimit":true,"PidsLimit":true,"CgroupVersion":"2","CgroupDriver":"systemd","SecurityOptions":["name=seccomp,profile=builtin","name=cgroupns"]}'
+    else
+      printf 'fixture-engine\n'
+    fi
+    ;;
   ps) printf 'fixture-container\n' ;;
   kill)
     [ "$#" -eq 1 ] && [ "$1" = fixture-container ] || exit 1
     ;;
   run) printf 'fixture-container\n' ;;
+  create)
+    prev=
+    memory=0
+    pids=
+    user=
+    for argument in "$@"; do
+      [ "$argument" = -- ] && break
+      case "$prev" in
+        -m) memory=${argument%m} ;;
+        --pids-limit) pids=$argument ;;
+        --user) user=$argument ;;
+      esac
+      prev=$argument
+    done
+    uid=${user%%:*}
+    gid=${user#*:}
+    printf 'fixture-%s-%s-%s-%s\n' "$memory" "$pids" "$uid" "$gid"
+    ;;
+  start)
+    [ "$1" = -a ] || exit 1
+    printf 'fixture-container\n'
+    ;;
   exec)
     while [ "$#" -gt 0 ]; do
       case "$1" in
@@ -20,7 +51,21 @@ case "$operation" in
     done
     exec "$@"
     ;;
-  inspect) printf 'running\n' ;;
+  inspect)
+    if [ "$1" = --format ]; then
+      id=$3
+      rest=${id#fixture-}
+      memory=${rest%%-*}
+      rest=${rest#*-}
+      pids=${rest%%-*}
+      rest=${rest#*-}
+      uid=${rest%%-*}
+      gid=${rest#*-}
+      printf '%s %s %s:%s\n' "$((memory * 1048576))" "$pids" "$uid" "$gid"
+    else
+      printf 'running\n'
+    fi
+    ;;
   rm) printf 'fixture-container\n' ;;
   *) printf 'unsupported fixture operation\n' >&2; exit 1 ;;
 esac

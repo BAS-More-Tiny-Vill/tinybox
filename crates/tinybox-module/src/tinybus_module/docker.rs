@@ -1,5 +1,6 @@
 //! Module-owned one-shot Docker execution.
 
+use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -9,6 +10,17 @@ use tinybox_bus::{
 };
 use tinybox_docker::{DockerCli, OneShot};
 use tinybus::{Error, Result};
+
+/// Fork capabilities the Docker run members enforce, advertised through
+/// `Capabilities`. On every run, `run_with_cli` enforces the non-root /
+/// 256-process floor (honouring a validated `user` / `pids_limit` within it),
+/// has the daemon's enforcement probed and the effective limits read back
+/// before start, and reports them, so
+/// [`tinybox_bus::HARDENED_DOCKER_RUN_FEATURE`] is listed on every platform.
+/// Remove it here if any of that enforcement is ever removed.
+pub(super) fn advertised_features() -> Vec<String> {
+    vec![tinybox_bus::HARDENED_DOCKER_RUN_FEATURE.to_owned()]
+}
 
 /// Run a bounded Docker command using the local Docker CLI.
 pub(super) async fn run(request: DockerRunRequest) -> Result<DockerRunOutput> {
@@ -146,31 +158,16 @@ async fn run_with_cli(
         spec = spec.with_pids_limit(pids_limit);
     }
 
-    let timeout = Duration::from_millis(request.timeout_ms);
-    if user.is_none() && request.pids_limit.is_none() {
-        let outcome = cli
-            .run_one_shot(&spec, timeout)
-            .await
-            .map_err(|_| failure("Docker client could not be started"))?;
-        return Ok(DockerRunOutput {
-            exit_code: outcome.exit_code,
-            stdout: outcome.stdout,
-            stderr: outcome.stderr,
-            timed_out: outcome.timed_out,
-            observed_limits: None,
-            killed: outcome.killed,
-            duration_ms: Some(outcome.duration_ms),
-        });
-    }
-
-    // DEF-32: a requested limit is not evidence that it is in force. Read the
-    // effective limits back (the caller's values, or the defaults for the
-    // ones it left unset) before the command starts, and do not start it
+    // DEF-32, always verified: a requested (or default) limit is not evidence
+    // that it is in force. Every run has the daemon's enforcement probed, and
+    // the effective limits (the caller's values, or the floor defaults for the
+    // ones it left unset) read back before the command starts; it never starts
     // otherwise.
+    let timeout = Duration::from_millis(request.timeout_ms);
     let verified = cli
         .run_one_shot_verified(&spec, timeout)
         .await
-        .map_err(|error| failure(&format!("Docker limits could not be verified: {error}")))?;
+        .map_err(|error| verification_failure(&error))?;
     let observed = verified.observed;
     let outcome = verified.outcome;
     Ok(DockerRunOutput {
@@ -186,6 +183,26 @@ async fn run_with_cli(
         killed: outcome.killed,
         duration_ms: Some(outcome.duration_ms),
     })
+}
+
+/// Map a verified-run error to a module error. An enforcement refusal
+/// (`ErrorKind::Unsupported`: the daemon reports it cannot enforce the process
+/// cap or the memory limit, so nothing was created) has its own stable name;
+/// a setup step that overran the deadline, and any other verification failure,
+/// stay `InvalidDockerRun` with distinct messages.
+fn verification_failure(error: &io::Error) -> Error {
+    match error.kind() {
+        io::ErrorKind::Unsupported => Error::MethodFailed {
+            name: tinybox_bus::DOCKER_LIMITS_UNENFORCEABLE.into(),
+            message: format!("Docker run refused: {error}"),
+        },
+        io::ErrorKind::TimedOut => failure(&format!(
+            "Docker limits could not be verified before the run deadline: {error}"
+        )),
+        _ => failure(&format!(
+            "Docker limits could not be verified, or the verified run could not be started: {error}"
+        )),
+    }
 }
 
 /// Parse a numeric `uid:gid`; names and partial forms are refused.
@@ -206,17 +223,25 @@ fn validate(request: &DockerRunRequest, mount_workspace: bool) -> Result<()> {
         return Err(failure("Docker run request is invalid"));
     }
     // The fork's non-root identity and process cap are the floor: a caller may
-    // pick another non-root identity or a tighter cap, never root or a looser cap.
+    // pick another non-root identity or a tighter cap, never root (uid 0 or
+    // gid 0) or a looser cap.
     if request
         .user
         .as_deref()
-        .is_some_and(|user| parse_user(user).is_none_or(|(uid, _)| uid == 0))
+        .is_some_and(|user| parse_user(user).is_none_or(|(uid, gid)| uid == 0 || gid == 0))
         || request
             .pids_limit
             .is_some_and(|n| n == 0 || n > tinybox_docker::MAX_ONE_SHOT_PIDS_LIMIT)
     {
         return Err(failure(
-            "Docker run request is invalid: user must be a non-root numeric uid:gid and pids_limit between 1 and 256",
+            "Docker run request is invalid: user must be a numeric uid:gid with non-zero uid and gid, and pids_limit between 1 and 256",
+        ));
+    }
+    // Docker reads `-m 0` as "no memory limit": refuse it instead of running
+    // unbounded.
+    if request.memory_limit_mb == Some(0) {
+        return Err(failure(
+            "Docker run request is invalid: memory_limit_mb must be at least 1",
         ));
     }
     let issues = tinybox_docker::run_policy_issues(
