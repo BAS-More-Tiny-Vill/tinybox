@@ -32,7 +32,8 @@
 //! way an unprivileged process can create a user namespace at all, because
 //! `kernel.apparmor_restrict_unprivileged_userns` blocks unconfined binaries
 //! from doing it. ADR 0005 records the decision; the workspace keeps
-//! `unsafe_code = "forbid"` everywhere, with no exception.
+//! `unsafe_code = "deny"` by default across the workspace. The single Windows
+//! FFI exception is scoped to `tinybox-jail/src/windows.rs` and checked in CI.
 //!
 //! # What this backend does not do
 //!
@@ -45,4 +46,7 @@ mod sandbox;
 
 pub use probe::{NamespaceProbe, UsernsStatus};
 
-pub use sandbox::{NAME, NamespaceSandbox, WORKSPACE_MOUNT};
+pub use sandbox::{
+    NAME, NamespaceSandbox, NativeJailCommand, WORKSPACE_MOUNT, native_jail_argv,
+    native_jail_argv_with_programs, trusted_systemd_run_program,
+};

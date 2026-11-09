@@ -51,9 +51,9 @@ async fn completed(resources: &Resources, process: &ProcessRef) -> Result<()> {
     .map_err(|_| tinybus::Error::failed("native fixture did not complete"))?
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_admission_is_bounded_until_outputs_are_explicitly_released() -> Result<()> {
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let resource = local_resource(&resources).await?;
     let mut processes = Vec::new();
     for _ in 0..MAX_STREAM_EXECUTIONS {
@@ -74,9 +74,81 @@ async fn live_admission_is_bounded_until_outputs_are_explicitly_released() -> Re
     Ok(())
 }
 
-#[tokio::test]
+#[test]
+fn cpu_quota_observer_cause_is_forwarded_before_process_exit() {
+    use tinybox_core::ExecutionObserver;
+
+    let journal = Arc::new(OutputJournal::default());
+    journal.termination_cause(tinybox_core::TerminationCause::CpuQuota);
+    let stream = stream_with(journal, false);
+
+    assert_eq!(
+        stream.terminal_events(Some(0)),
+        vec![
+            tinybox_bus::SandboxEvent::LimitHit {
+                limit: tinybox_bus::LimitKind::Cpu,
+            },
+            tinybox_bus::SandboxEvent::Exited { status: Some(0) },
+        ]
+    );
+}
+
+#[test]
+fn a_timed_out_stream_keeps_its_cpu_event_and_exits_only_once_cleaned_up() {
+    use tinybox_bus::{LimitKind, SandboxEvent};
+    use tinybox_core::ExecutionObserver;
+
+    let cpu = SandboxEvent::LimitHit {
+        limit: LimitKind::Cpu,
+    };
+    let timeout = SandboxEvent::LimitHit {
+        limit: LimitKind::Timeout,
+    };
+    let journal = Arc::new(OutputJournal::default());
+    journal.termination_cause(tinybox_core::TerminationCause::CpuQuota);
+    journal.finish_failed(ExecutionFailure::CleanupFailed);
+    let stream = stream_with(journal.clone(), true);
+    assert_eq!(
+        stream.terminal_events(None),
+        vec![cpu.clone(), timeout.clone()]
+    );
+    journal.finish_failed(ExecutionFailure::TimedOut);
+    assert_eq!(
+        stream.terminal_events(None),
+        vec![cpu, timeout, SandboxEvent::Exited { status: None }]
+    );
+}
+
+fn stream_with(journal: Arc<OutputJournal>, timed_out: bool) -> StreamExecution {
+    let process = ProcessRef {
+        resource: ResourceId("resource".into()),
+        process: ResourceId("process".into()),
+    };
+    StreamExecution {
+        request: SpawnRequest {
+            process: process.process.clone(),
+            command: ExecRequest {
+                resource: process.resource.clone(),
+                argv: true_command(),
+                cwd: None,
+                env: std::collections::BTreeMap::new(),
+                stdin: None,
+            },
+        },
+        shell: None,
+        platform_shell: None,
+        jail: None,
+        journal,
+        task: Mutex::new(None),
+        collector: Collector::Host(Arc::new(tinybox_host::LimitedLocalHost::new(64)), None),
+        timed_out: Arc::new(std::sync::atomic::AtomicBool::new(timed_out)),
+        event_publisher_claimed: std::sync::atomic::AtomicBool::new(false),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stream_replay_keeps_request_identity_and_rejects_cross_resource_handles() -> Result<()> {
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let resource = local_resource(&resources).await?;
     let other = local_resource(&resources).await?;
     let request = request(&resources, &resource, true_command()).await?;
@@ -103,9 +175,9 @@ async fn stream_replay_keeps_request_identity_and_rejects_cross_resource_handles
 }
 
 #[cfg(unix)]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn close_acknowledges_active_stream_cleanup_and_retires_its_output() -> Result<()> {
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let resource = local_resource(&resources).await?;
     let request = request(
         &resources,
@@ -131,9 +203,9 @@ async fn close_acknowledges_active_stream_cleanup_and_retires_its_output() -> Re
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rejected_start_keeps_its_reservation_and_provider_failures_use_safe_codes() -> Result<()> {
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let resource = local_resource(&resources).await?;
     let mut empty = request(&resources, &resource, Vec::new()).await?;
     assert!(resources.start_exec(empty.clone()).await.is_err());
@@ -153,13 +225,13 @@ async fn rejected_start_keeps_its_reservation_and_provider_failures_use_safe_cod
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unowned_collector_or_unsupported_platform_refuses_live_execution() -> Result<()> {
     for platform in [
         crate::tinybus_module::Platform::current(),
         crate::tinybus_module::Platform::Other,
     ] {
-        let resources = Resources::default();
+        let resources = Resources::test_resources();
         let resource = resources.reserve(ReserveRequest::Resource).await?;
         resources
             .create_on_for_platform(
@@ -180,7 +252,7 @@ async fn an_unowned_collector_or_unsupported_platform_refuses_live_execution() -
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(
     clippy::panic,
     reason = "exercise acknowledged ownership after an unexpected execution task panic"
@@ -209,6 +281,7 @@ async fn a_panicked_job_is_joined_and_cleanup_failure_stays_owned_until_retry() 
         shell: None,
         platform_shell: None,
         timed_out: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        event_publisher_claimed: std::sync::atomic::AtomicBool::new(false),
         journal,
         task: Mutex::new(Some(task)),
         collector: Collector::Host(Arc::new(tinybox_host::LimitedLocalHost::new(64)), None),
@@ -222,10 +295,10 @@ async fn a_panicked_job_is_joined_and_cleanup_failure_stays_owned_until_retry() 
 }
 
 #[cfg(unix)]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exceeding_live_output_budget_stops_the_child_and_reports_a_safe_terminal_code()
 -> Result<()> {
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let resource = local_resource(&resources).await?;
     let request = request(&resources, &resource, vec!["/bin/sh".into(), "-c".into(), "while :; do printf 012345678901234567890123456789012345678901234567890123456789012345; done".into()]).await?;
     let process = resources.start_exec(request).await?;
@@ -242,12 +315,12 @@ async fn exceeding_live_output_budget_stops_the_child_and_reports_a_safe_termina
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_lost_reply_retries_reuse_the_same_execution_instead_of_consuming_twice()
 -> Result<()> {
     use std::future::{Future, poll_fn};
     use std::task::Poll;
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let resource = local_resource(&resources).await?;
     let request = request(&resources, &resource, true_command()).await?;
     let slot = resources.slot(&resource).await?;
@@ -275,9 +348,9 @@ async fn concurrent_lost_reply_retries_reuse_the_same_execution_instead_of_consu
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn jailed_start_rejects_missing_grants_without_consuming_reservation() -> Result<()> {
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let resource = local_resource(&resources).await?;
     let pending = request(&resources, &resource, true_command()).await?;
     let config = tinybox_bus::NativeJailConfig {
@@ -353,7 +426,7 @@ impl tinybox_core::Host for RemoteObservedFixture {
         }
     }
 }
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_cleanup_failure_keeps_binary_output_and_owner_until_retry_ack() -> Result<()> {
     let host = Arc::new(RemoteObservedFixture {
         pending: std::sync::atomic::AtomicBool::new(false),
@@ -522,9 +595,9 @@ async fn mock_docker_resource(
         .await?;
     Ok(resource)
 }
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn docker_resources_use_distinct_container_names() -> Result<()> {
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let host = Arc::new(DockerFaultHost::default());
     let first = mock_docker_resource(&resources, host.clone()).await?;
     let second = mock_docker_resource(&resources, host.clone()).await?;
@@ -539,10 +612,10 @@ async fn docker_resources_use_distinct_container_names() -> Result<()> {
     resources.close(&second).await?;
     Ok(())
 }
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn confirmed_container_destroy_keeps_native_cleanup_retryable_without_destroying_twice()
 -> Result<()> {
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let host = Arc::new(DockerFaultHost::default());
     host.reject_retry
         .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -592,11 +665,11 @@ async fn confirmed_container_destroy_keeps_native_cleanup_retryable_without_dest
 }
 
 #[cfg(unix)]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn collector_drain_joins_its_owned_active_native_supervisor() -> Result<()> {
     use std::future::Future;
     use std::task::Poll;
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let resource = local_resource(&resources).await?;
     let request = request(
         &resources,
@@ -658,10 +731,10 @@ async fn shell_request(
         hide_window: false,
     })
 }
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_shell_replay_uses_original_request_and_retains_scratch_until_release()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let resource = local_resource(&resources).await?;
     let state = tempfile::tempdir()?;
     let request = shell_request(&resources, &resource, state.path(), "echo owned").await?;
@@ -682,10 +755,10 @@ async fn native_shell_replay_uses_original_request_and_retains_scratch_until_rel
     resources.close(&resource).await?;
     Ok(())
 }
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_shell_invalid_budget_does_not_consume_its_reservation()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let resource = local_resource(&resources).await?;
     let state = tempfile::tempdir()?;
     let mut request = shell_request(&resources, &resource, state.path(), "echo accepted").await?;
@@ -698,10 +771,10 @@ async fn native_shell_invalid_budget_does_not_consume_its_reservation()
     resources.close(&resource).await?;
     Ok(())
 }
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_shell_timeout_acknowledges_child_cleanup_before_output_release()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let resource = local_resource(&resources).await?;
     let state = tempfile::tempdir()?;
     #[cfg(unix)]
@@ -729,11 +802,11 @@ async fn native_shell_timeout_acknowledges_child_cleanup_before_output_release()
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(unix)]
 async fn native_shell_clears_startup_hooks_after_approved_overrides_and_captures_binary_pipes()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let resource = local_resource(&resources).await?;
     let state = tempfile::tempdir()?;
     let startup = state.path().join("startup.sh");
@@ -776,11 +849,11 @@ async fn native_shell_clears_startup_hooks_after_approved_overrides_and_captures
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(unix)]
 async fn native_shell_output_limit_terminates_and_reaps_before_release()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let resource = local_resource(&resources).await?;
     let state = tempfile::tempdir()?;
     let request = shell_request(&resources, &resource, state.path(), "yes output").await?;
@@ -798,11 +871,11 @@ async fn native_shell_output_limit_terminates_and_reaps_before_release()
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_scratch_deletion_keeps_output_and_close_retryable()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
     for close in [false, true] {
-        let resources = Resources::default();
+        let resources = Resources::test_resources();
         let resource = local_resource(&resources).await?;
         let state = tempfile::tempdir()?;
         let request = shell_request(&resources, &resource, state.path(), "echo owned").await?;
@@ -833,10 +906,10 @@ async fn failed_scratch_deletion_keeps_output_and_close_retryable()
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_shell_refuses_nonlocal_or_nondirectory_collectors_before_admission()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let resource = local_resource(&resources).await?;
     let state = tempfile::tempdir()?;
     let shell = shell_request(&resources, &resource, state.path(), "echo owned").await?;
@@ -868,10 +941,10 @@ async fn native_shell_refuses_nonlocal_or_nondirectory_collectors_before_admissi
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelled_native_shell_retains_scratch_until_output_release()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let resource = local_resource(&resources).await?;
     let state = tempfile::tempdir()?;
     #[cfg(unix)]
@@ -889,9 +962,11 @@ async fn cancelled_native_shell_retains_scratch_until_output_release()
     })
     .await??;
     resources.cancel(&process).await?;
+    let output = resources.read_output(&process, 0).await?;
     assert_eq!(
-        resources.read_output(&process, 0).await?.state,
-        ExecutionState::Cancelled
+        output.state,
+        ExecutionState::Cancelled,
+        "cancellation failed after captured output: {output:?}"
     );
     let scratch = state.path().join("artifacts/sandbox-scratch");
     assert_eq!(std::fs::read_dir(&scratch)?.count(), 1);
@@ -901,9 +976,9 @@ async fn cancelled_native_shell_retains_scratch_until_output_release()
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_shell_execution_preserves_admission_and_request_identity() -> Result<()> {
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let resource = local_resource(&resources).await?;
     let request = request(&resources, &resource, Vec::new()).await?;
     let shell = tinybox_bus::SelectShellRequest {
@@ -952,9 +1027,9 @@ async fn native_shell_execution_preserves_admission_and_request_identity() -> Re
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shell_execution_rejects_remote_selection_without_consuming_admission() -> Result<()> {
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let resource = local_resource(&resources).await?;
     let request = request(&resources, &resource, Vec::new()).await?;
     let shell = tinybox_bus::SelectShellRequest {
@@ -990,10 +1065,10 @@ async fn shell_execution_rejects_remote_selection_without_consuming_admission() 
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn timeout_status_survives_failed_cleanup_until_retry_acknowledges_it()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let resource = local_resource(&resources).await?;
     let state = tempfile::tempdir()?;
     let mut shell = shell_request(&resources, &resource, state.path(), "unused").await?;
@@ -1043,10 +1118,10 @@ async fn timeout_status_survives_failed_cleanup_until_retry_acknowledges_it()
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn close_during_shell_preparation_fences_admission_without_waiting_for_filesystem()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let resources = Arc::new(Resources::default());
+    let resources = Arc::new(Resources::test_resources());
     let resource = local_resource(&resources).await?;
     let state = tempfile::tempdir()?;
     let shell = shell_request(&resources, &resource, state.path(), "echo must-not-run").await?;
@@ -1118,10 +1193,10 @@ async fn close_during_shell_preparation_fences_admission_without_waiting_for_fil
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_shell_replay_ignores_rediscovered_program()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let resource = local_resource(&resources).await?;
     let state = tempfile::tempdir()?;
     let shell = shell_request(&resources, &resource, state.path(), "echo replay").await?;
@@ -1136,11 +1211,11 @@ async fn native_shell_replay_ignores_rediscovered_program()
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rejected_shell_scratch_cleanup_is_retained_for_close_and_shutdown_retry()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
     for shutdown in [false, true] {
-        let resources = Resources::default();
+        let resources = Resources::test_resources();
         let resource = local_resource(&resources).await?;
         let state = tempfile::tempdir()?;
         let shell = shell_request(&resources, &resource, state.path(), "echo must-not-run").await?;
@@ -1187,9 +1262,9 @@ async fn rejected_shell_scratch_cleanup_is_retained_for_close_and_shutdown_retry
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unreserved_shell_processes_are_rejected_before_preparation() -> Result<()> {
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let resource = local_resource(&resources).await?;
     let request = SpawnRequest {
         process: ResourceId("unreserved-process".into()),
@@ -1217,10 +1292,10 @@ async fn unreserved_shell_processes_are_rejected_before_preparation() -> Result<
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rejected_scratch_failure_does_not_prevent_close_from_fencing_and_stopping_streams()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let resource = local_resource(&resources).await?;
     let state = tempfile::tempdir()?;
     let shell_request = shell_request(&resources, &resource, state.path(), "echo unused").await?;
@@ -1260,10 +1335,10 @@ async fn rejected_scratch_failure_does_not_prevent_close_from_fencing_and_stoppi
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_preparations_share_a_bounded_admission_budget()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let resources = Arc::new(Resources::default());
+    let resources = Arc::new(Resources::test_resources());
     let resource = local_resource(&resources).await?;
     let request = request(&resources, &resource, true_command()).await?;
     let (entered, mut receiver) = tokio::sync::mpsc::channel(1);
@@ -1310,4 +1385,285 @@ async fn concurrent_preparations_share_a_bounded_admission_budget()
         MAX_STREAM_EXECUTIONS
     );
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resource_aware_bus_exec_cancellation_reports_events_and_reaps_descendants()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    if !native_resource_bus_available() {
+        eprintln!("skipped: rootless systemd scope and bubblewrap namespaces are unavailable");
+        return Ok(());
+    }
+    let root = tempfile::tempdir()?;
+    let resources = Resources::test_resources();
+    let resource = resources.reserve(ReserveRequest::Resource).await?;
+    resources
+        .create(CreateRequest {
+            resource: resource.clone(),
+            backend: "passthrough".into(),
+            workspace: Workspace::Directory(root.path().display().to_string()),
+            ..Default::default()
+        })
+        .await?;
+    let python = detached_descendant_script();
+    let cancel_file = root.path().join("cancelled-descendant");
+    let cancelled =
+        start_resource_descendant(&resources, &resource, root.path(), &cancel_file, &python)
+            .await?;
+    let (cancel_pid, cancel_ns) =
+        wait_for_resource_descendant(&resources, &cancelled, &cancel_file, true).await?;
+    assert!(
+        process_in_namespace(cancel_pid, cancel_ns)?,
+        "fixture descendant was not visible before cancellation"
+    );
+    cancel_resource_descendant(&resources, &cancelled, cancel_pid, cancel_ns).await?;
+    resources.release_output(&cancelled).await?;
+
+    let destroy_file = root.path().join("destroyed-descendant");
+    let destroyed =
+        start_resource_descendant(&resources, &resource, root.path(), &destroy_file, &python)
+            .await?;
+    let (destroy_pid, destroy_ns) =
+        wait_for_resource_descendant(&resources, &destroyed, &destroy_file, false).await?;
+    assert!(
+        process_in_namespace(destroy_pid, destroy_ns)?,
+        "fixture descendant was not visible before destroy"
+    );
+    resources.close(&resource).await?;
+    assert!(
+        !process_in_namespace(destroy_pid, destroy_ns)?,
+        "resource destroy left a detached namespace process alive"
+    );
+    resources.shutdown().await?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn native_resource_bus_available() -> bool {
+    use std::{os::unix::fs::FileTypeExt, process::Command};
+    let bus = std::env::var("DBUS_SESSION_BUS_ADDRESS")
+        .ok()
+        .and_then(|address| address.strip_prefix("unix:path=").map(str::to_owned))
+        .is_some_and(|path| {
+            std::fs::metadata(path).is_ok_and(|metadata| metadata.file_type().is_socket())
+        });
+    let scope = Command::new("systemd-run")
+        .args([
+            "--user",
+            "--scope",
+            "--quiet",
+            "--property=MemoryMax=67108864",
+            "--property=MemorySwapMax=0",
+            "--property=OOMPolicy=continue",
+            "--property=CPUQuota=100%",
+            "--property=TasksMax=16",
+            "--",
+            "/bin/true",
+        ])
+        .status()
+        .is_ok_and(|status| status.success());
+    let namespaces = Command::new("bwrap")
+        .args([
+            "--unshare-user",
+            "--unshare-pid",
+            "--unshare-net",
+            "--ro-bind",
+            "/usr",
+            "/usr",
+            "--symlink",
+            "usr/lib",
+            "/lib",
+            "--symlink",
+            "usr/lib64",
+            "/lib64",
+            "--",
+            "/usr/bin/true",
+        ])
+        .status()
+        .is_ok_and(|status| status.success());
+    let available = bus && scope && namespaces;
+    if std::env::var_os("TINYBOX_REQUIRE_NATIVE_RESOURCE_TESTS").is_some() {
+        assert!(available, "required native resource runtime is unavailable");
+    }
+    available
+}
+
+#[cfg(target_os = "linux")]
+fn native_resource_test_environment() -> std::collections::BTreeMap<String, String> {
+    ["DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR"]
+        .into_iter()
+        .filter_map(|name| {
+            std::env::var(name)
+                .ok()
+                .map(|value| (name.to_owned(), value))
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn detached_descendant_script() -> String {
+    "import os,time,sys\nfirst=os.fork()\nif first == 0:\n os.setsid()\n second=os.fork()\n if second == 0:\n  with open(sys.argv[1],'w') as f: f.write(f'{os.getpid()} {os.stat(\"/proc/self/ns/pid\").st_ino}')\n  while True: time.sleep(1)\n os._exit(0)\nos.waitpid(first,0)\nwhile not os.path.exists(sys.argv[1]) or os.path.getsize(sys.argv[1]) == 0: time.sleep(0.01)\nprint('stdout-ready',flush=True)\nprint('stderr-ready',file=sys.stderr,flush=True)\ntime.sleep(600)".into()
+}
+
+#[cfg(target_os = "linux")]
+async fn start_resource_descendant(
+    resources: &Resources,
+    resource: &ResourceId,
+    root: &std::path::Path,
+    pid_file: &std::path::Path,
+    python: &str,
+) -> std::result::Result<ProcessRef, Box<dyn std::error::Error>> {
+    let process_id = resources
+        .reserve(ReserveRequest::Process(resource.clone()))
+        .await?;
+    let process = ProcessRef {
+        resource: resource.clone(),
+        process: process_id.clone(),
+    };
+    resources
+        .start_jailed_exec_with_resources(
+            SpawnRequest {
+                process: process_id,
+                command: ExecRequest {
+                    resource: resource.clone(),
+                    argv: vec![
+                        "python3".into(),
+                        "-c".into(),
+                        python.into(),
+                        pid_file.display().to_string(),
+                    ],
+                    cwd: Some(root.display().to_string()),
+                    env: native_resource_test_environment(),
+                    stdin: None,
+                },
+            },
+            tinybox_bus::NativeJailRequest {
+                jail: tinybox_bus::NativeJailConfig {
+                    read_only: vec![],
+                    read_write: vec![],
+                    allow_net: false,
+                    allow_subprocess: true,
+                    enforcement: tinybox_bus::JailEnforcement::Enforced,
+                    require_process_isolation: true,
+                    deny_read: vec![],
+                    resources: None,
+                },
+                resources: Some(tinybox_bus::NativeJailResourceRequest {
+                    cpu_millis: Some(1000),
+                    memory_bytes: Some(64 * 1024 * 1024),
+                    pids_max: Some(16),
+                    disk_bytes: None,
+                }),
+            },
+        )
+        .await?;
+    Ok(process)
+}
+
+#[cfg(target_os = "linux")]
+async fn wait_for_resource_descendant(
+    resources: &Resources,
+    process: &ProcessRef,
+    pid_file: &std::path::Path,
+    check_streams: bool,
+) -> std::result::Result<(i32, u64), Box<dyn std::error::Error>> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let batch = resources.read_output(process, 0).await?;
+        let stream_has = |stream, marker: &[u8]| {
+            let bytes: Vec<_> = batch
+                .chunks
+                .iter()
+                .filter(|chunk| chunk.stream == stream)
+                .flat_map(|chunk| chunk.bytes.iter().copied())
+                .collect();
+            bytes.windows(marker.len()).any(|window| window == marker)
+        };
+        let streams_ready = !check_streams
+            || (stream_has(tinybox_bus::OutputStream::Stdout, b"stdout-ready")
+                && stream_has(tinybox_bus::OutputStream::Stderr, b"stderr-ready"));
+        if streams_ready && std::fs::metadata(pid_file).is_ok_and(|metadata| metadata.len() > 0) {
+            let identity = std::fs::read_to_string(pid_file)?;
+            let mut parts = identity.split_whitespace();
+            return Ok((
+                parts.next().ok_or("missing detached PID")?.parse()?,
+                parts.next().ok_or("missing PID namespace")?.parse()?,
+            ));
+        }
+        if batch.state != ExecutionState::Running || tokio::time::Instant::now() >= deadline {
+            return Err(
+                format!("native bus exec failed before descendant identity: {batch:?}").into(),
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn cancel_resource_descendant(
+    resources: &Resources,
+    process: &ProcessRef,
+    pid: i32,
+    namespace: u64,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    resources.cancel(process).await?;
+    let cancelled = resources.read_output(process, 0).await?;
+    assert_eq!(cancelled.state, ExecutionState::Cancelled);
+    assert!(
+        cancelled
+            .chunks
+            .iter()
+            .any(|chunk| chunk.stream == tinybox_bus::OutputStream::Stdout)
+            && cancelled
+                .chunks
+                .iter()
+                .any(|chunk| chunk.stream == tinybox_bus::OutputStream::Stderr),
+        "cancellation must preserve both output streams"
+    );
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    while process_in_namespace(pid, namespace)? {
+        if tokio::time::Instant::now() >= deadline {
+            return Err("bus cancellation left a detached namespace process alive".into());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn process_in_namespace(pid: i32, namespace_inode: u64) -> std::io::Result<bool> {
+    for entry in std::fs::read_dir("/proc")? {
+        let Ok(entry) = entry else { continue };
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .bytes()
+            .all(|byte| byte.is_ascii_digit())
+        {
+            continue;
+        }
+        let Ok(status) = std::fs::read_to_string(entry.path().join("status")) else {
+            continue;
+        };
+        let Ok(namespace) = std::fs::read_link(entry.path().join("ns/pid")) else {
+            continue;
+        };
+        let same_pid = status
+            .lines()
+            .find_map(|line| line.strip_prefix("NSpid:"))
+            .and_then(|pids| pids.split_whitespace().last())
+            .and_then(|pid| pid.parse::<i32>().ok())
+            == Some(pid);
+        let same_namespace = namespace
+            .to_string_lossy()
+            .strip_prefix("pid:[")
+            .and_then(|inode| inode.strip_suffix(']'))
+            .and_then(|inode| inode.parse::<u64>().ok())
+            == Some(namespace_inode);
+        if same_pid && same_namespace {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }

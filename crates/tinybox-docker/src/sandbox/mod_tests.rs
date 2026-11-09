@@ -8,7 +8,7 @@
 //!
 //! Behavior that genuinely needs a daemon lives in `tests/live_docker.rs`.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{
     Arc, Mutex, MutexGuard, PoisonError,
     atomic::{AtomicBool, Ordering},
@@ -16,12 +16,731 @@ use std::sync::{
 
 use async_trait::async_trait;
 use tinybox_core::{
-    BoxId, BoxSpec, BoxState, Capability, Error, ExecOutput, ExecRequest, Host, HostRef,
-    IsolationLevel, MemoryStore, NetworkPolicy, Placement, PortMapping, Resources, Result, Sandbox,
-    SandboxRef, SnapshotId, SnapshotSupport, Store, WorkspaceSource,
+    BoxId, BoxSpec, BoxState, Capability, Error, ExecOutput, ExecRequest, Host,
+    HostExecutionLocation, HostRef, IsolationLevel, MemoryStore, NetworkPolicy, Placement,
+    PortMapping, Resources, Result, Sandbox, SandboxRef, SnapshotId, SnapshotSupport, Store,
+    WorkspaceSource,
 };
 
 use super::{DockerSandbox, NAME, args, cleanup_timeout_error, state};
+
+#[derive(Debug)]
+struct RecordingEgressController;
+
+#[async_trait]
+impl super::DockerEgressController for RecordingEgressController {
+    async fn prepare(
+        &self,
+        host: &dyn Host,
+        _namespace: &str,
+        _id: &BoxId,
+        _allowlist: &tinybox_core::EgressAllowlist,
+    ) -> Result<crate::PreparedEgressNetwork> {
+        host.run(&ExecRequest::new(["controller", "prepare"]))
+            .await?;
+        Ok(crate::PreparedEgressNetwork::new(
+            "tinybox-allowlist-test".to_owned(),
+            vec![(
+                "api.example.test".to_owned(),
+                std::net::IpAddr::from([203, 0, 113, 10]),
+            )],
+        ))
+    }
+
+    async fn cleanup(&self, host: &dyn Host, _namespace: &str, _id: &BoxId) -> Result<()> {
+        host.run(&ExecRequest::new(["controller", "cleanup"]))
+            .await?;
+        Ok(())
+    }
+
+    fn docker_argv(&self, argv: Vec<String>) -> Vec<String> {
+        argv
+    }
+}
+
+#[derive(Debug)]
+struct NonIdempotentArgController;
+
+#[async_trait]
+impl super::DockerEgressController for NonIdempotentArgController {
+    async fn prepare(
+        &self,
+        _host: &dyn Host,
+        _namespace: &str,
+        _id: &BoxId,
+        _allowlist: &tinybox_core::EgressAllowlist,
+    ) -> Result<crate::PreparedEgressNetwork> {
+        Ok(crate::PreparedEgressNetwork::new(
+            "tinybox-allowlist-test".to_owned(),
+            Vec::new(),
+        ))
+    }
+
+    async fn cleanup(&self, _host: &dyn Host, _namespace: &str, _id: &BoxId) -> Result<()> {
+        Ok(())
+    }
+
+    fn docker_argv(&self, mut argv: Vec<String>) -> Vec<String> {
+        argv.push("rewrite-once".to_owned());
+        argv
+    }
+}
+
+#[tokio::test]
+async fn docker_argv_controller_rewrites_each_command_once() -> Result<()> {
+    let host = ScriptedHost::silent();
+    let sandbox = DockerSandbox::new(host.clone(), Arc::new(MemoryStore::new()))
+        .with_egress_controller(Arc::new(NonIdempotentArgController));
+    let allowlist = tinybox_core::EgressAllowlist::new(["api.example.test"], [443]);
+
+    sandbox
+        .create(&spec()?.with_network(NetworkPolicy::Allowlist(allowlist)))
+        .await?;
+
+    let docker_commands = host
+        .commands()
+        .into_iter()
+        .filter(|argv| argv.first().is_some_and(|arg| arg == "docker"))
+        .collect::<Vec<_>>();
+    assert_ne!(docker_commands.len(), 0);
+    assert!(docker_commands.iter().all(|argv| {
+        argv.iter()
+            .filter(|arg| arg.as_str() == "rewrite-once")
+            .count()
+            == 1
+    }));
+    Ok(())
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // Keep credential redaction and env-file lifetime assertions together.
+fn controller_preserves_requested_docker_variables_for_the_workload() -> Result<()> {
+    #[derive(Debug)]
+    struct Resolver;
+
+    impl crate::EgressResolver for Resolver {
+        fn resolve(&self, _hostname: &str) -> std::io::Result<Vec<std::net::IpAddr>> {
+            Ok(Vec::new())
+        }
+    }
+
+    let controller = Arc::new(crate::NativeLinuxDockerEgressController::new(Arc::new(
+        Resolver,
+    )));
+    let host = super::ControllerHost {
+        inner: ScriptedHost::local(),
+        controller,
+    };
+    let mut request = ExecRequest::new([
+        "docker",
+        "run",
+        "--env",
+        "DOCKER_HOST",
+        "--env",
+        "DOCKER_CONTEXT",
+        "--env",
+        "DOCKER_TLS_VERIFY",
+        "--env",
+        "DOCKER_CERT_PATH",
+        "--env",
+        "APP_MODE",
+        "--",
+        "image",
+    ]);
+    request.env.insert(
+        "DOCKER_HOST".to_owned(),
+        "tcp://workload-docker:2376".to_owned(),
+    );
+    request
+        .env
+        .insert("DOCKER_CONTEXT".to_owned(), "workload-context".to_owned());
+    request
+        .env
+        .insert("DOCKER_TLS_VERIFY".to_owned(), "1".to_owned());
+    request
+        .env
+        .insert("DOCKER_CERT_PATH".to_owned(), "/workload/certs".to_owned());
+    request.env.insert("APP_MODE".to_owned(), "test".to_owned());
+
+    let prepared = host.request(&request)?;
+    let rewritten = &prepared.request;
+
+    assert!(
+        rewritten
+            .argv
+            .windows(2)
+            .any(|args| args == ["--env", "DOCKER_HOST"])
+    );
+    assert!(
+        rewritten
+            .argv
+            .windows(2)
+            .any(|args| args == ["--env", "DOCKER_CONTEXT"])
+    );
+    assert!(!rewritten.argv.windows(2).any(|args| {
+        args == ["--env", "DOCKER_TLS_VERIFY"] || args == ["--env", "DOCKER_CERT_PATH"]
+    }));
+    let env_file = rewritten
+        .argv
+        .windows(2)
+        .find(|args| args[0] == "--env-file")
+        .map(|args| args[1].as_str())
+        .ok_or_else(|| Error::Backend {
+            sandbox: NAME.to_owned(),
+            operation: "test Docker workload environment file",
+            message: "missing env file argument".to_owned(),
+        })?;
+    let env_file_contents = std::fs::read_to_string(env_file)
+        .map_err(|error| Error::io("read Docker workload environment file in test", &error))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let mode = std::fs::metadata(env_file)
+            .map_err(|error| Error::io("inspect Docker workload environment file in test", &error))?
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+    assert!(env_file_contents.contains("DOCKER_TLS_VERIFY=1\n"));
+    assert!(env_file_contents.contains("DOCKER_CERT_PATH=/workload/certs\n"));
+    assert!(!rewritten.argv.join(" ").contains("/workload/certs"));
+    let argv = rewritten.argv.join(" ");
+    for value in [
+        "tcp://workload-docker:2376",
+        "workload-context",
+        "/workload/certs",
+    ] {
+        assert!(!argv.contains(value));
+    }
+    assert_eq!(
+        rewritten.env.get("DOCKER_HOST").map(String::as_str),
+        Some("tcp://workload-docker:2376")
+    );
+    assert_eq!(
+        rewritten.env.get("DOCKER_CONTEXT").map(String::as_str),
+        Some("workload-context")
+    );
+    assert_eq!(
+        rewritten.env.get("DOCKER_TLS_VERIFY").map(String::as_str),
+        Some("")
+    );
+    assert_eq!(
+        rewritten.env.get("DOCKER_CERT_PATH").map(String::as_str),
+        Some("")
+    );
+    assert_eq!(
+        rewritten.env.get("APP_MODE").map(String::as_str),
+        Some("test")
+    );
+
+    let env_file = env_file.to_owned();
+    drop(prepared);
+    assert!(!std::path::Path::new(&env_file).exists());
+    Ok(())
+}
+
+#[test]
+fn native_controller_leaves_nonlocal_docker_commands_and_environment_alone() -> Result<()> {
+    #[derive(Debug)]
+    struct Resolver;
+
+    impl crate::EgressResolver for Resolver {
+        fn resolve(&self, _hostname: &str) -> std::io::Result<Vec<std::net::IpAddr>> {
+            Ok(Vec::new())
+        }
+    }
+
+    let controller = Arc::new(crate::NativeLinuxDockerEgressController::new(Arc::new(
+        Resolver,
+    )));
+    let host = super::ControllerHost {
+        inner: ScriptedHost::silent(),
+        controller,
+    };
+    let mut request = ExecRequest::new(["docker", "run", "--env", "DOCKER_TLS_VERIFY"]);
+    request
+        .env
+        .insert("DOCKER_TLS_VERIFY".to_owned(), "1".to_owned());
+
+    let prepared = host.request(&request)?;
+    assert_eq!(prepared.request.argv, request.argv);
+    assert_eq!(prepared.request.env, request.env);
+    Ok(())
+}
+
+#[test]
+fn docker_workload_env_files_reject_newline_values() {
+    let mut request = ExecRequest::new(["docker", "run"]);
+    request.env.insert(
+        "DOCKER_CERT_PATH".to_owned(),
+        "/certs\nINJECTED=value".to_owned(),
+    );
+
+    assert!(super::write_workload_docker_env_file(&mut request).is_err());
+}
+
+#[test]
+fn docker_env_file_rewrite_preserves_exec_workload_arguments() -> Result<()> {
+    #[derive(Debug)]
+    struct Resolver;
+
+    impl crate::EgressResolver for Resolver {
+        fn resolve(&self, _hostname: &str) -> std::io::Result<Vec<std::net::IpAddr>> {
+            Ok(Vec::new())
+        }
+    }
+
+    let controller = Arc::new(crate::NativeLinuxDockerEgressController::new(Arc::new(
+        Resolver,
+    )));
+    let host = super::ControllerHost {
+        inner: ScriptedHost::local(),
+        controller,
+    };
+    let mut request = ExecRequest::new([
+        "docker",
+        "exec",
+        "tinybox-box",
+        "printf",
+        "--env",
+        "DOCKER_TLS_VERIFY",
+    ]);
+    request
+        .env
+        .insert("DOCKER_TLS_VERIFY".to_owned(), "1".to_owned());
+
+    let prepared = host.request(&request)?;
+    assert_eq!(
+        &prepared.request.argv[prepared.request.argv.len() - 3..],
+        ["printf", "--env", "DOCKER_TLS_VERIFY"]
+    );
+    Ok(())
+}
+
+#[test]
+fn remote_docker_client_keeps_tls_environment_without_a_local_env_file() -> Result<()> {
+    let host = super::ControllerHost {
+        inner: ScriptedHost::remote(),
+        controller: Arc::new(RecordingEgressController),
+    };
+    let mut request =
+        ExecRequest::new(["docker", "run", "--env", "DOCKER_TLS_VERIFY", "--", "image"]);
+    request
+        .env
+        .insert("DOCKER_TLS_VERIFY".to_owned(), "1".to_owned());
+
+    let prepared = host.request(&request)?;
+    assert_eq!(prepared.request.argv, request.argv);
+    assert_eq!(prepared.request.env, request.env);
+    Ok(())
+}
+
+#[test]
+fn custom_local_docker_controller_preserves_daemon_tls_environment() -> Result<()> {
+    let host = super::ControllerHost {
+        inner: ScriptedHost::local(),
+        controller: Arc::new(RecordingEgressController),
+    };
+    let mut request = ExecRequest::new(["docker", "info"]);
+    request
+        .env
+        .insert("DOCKER_TLS_VERIFY".to_owned(), "1".to_owned());
+    request
+        .env
+        .insert("DOCKER_CERT_PATH".to_owned(), "/daemon/certs".to_owned());
+
+    let prepared = host.request(&request)?;
+    assert_eq!(prepared.request.argv, request.argv);
+    assert_eq!(prepared.request.env, request.env);
+    Ok(())
+}
+
+#[tokio::test]
+async fn allowlist_controller_prepares_before_start_and_cleans_after_destroy() -> Result<()> {
+    let host = ScriptedHost::silent();
+    let sandbox = DockerSandbox::new(host.clone(), Arc::new(MemoryStore::new()))
+        .with_egress_controller(Arc::new(RecordingEgressController));
+    let allowlist = tinybox_core::EgressAllowlist::new(["api.example.test"], [443]);
+    let info = sandbox
+        .create(&spec()?.with_network(NetworkPolicy::Allowlist(allowlist)))
+        .await?;
+
+    let commands = host.commands();
+    assert_eq!(commands[0], ["controller", "prepare"]);
+    assert_eq!(commands[1][0], "docker");
+    assert!(commands[1].contains(&"--network".to_owned()));
+    assert!(commands[1].contains(&"tinybox-allowlist-test".to_owned()));
+    assert_eq!(flag_value(&commands[1], "--dns"), Some("127.0.0.1"));
+    assert!(
+        commands[1]
+            .windows(2)
+            .any(|args| { args[0] == "--add-host" && args[1] == "api.example.test:203.0.113.10" })
+    );
+
+    sandbox.destroy(&info.id).await?;
+    let commands = host.commands();
+    assert_eq!(commands[2][0], "docker");
+    assert_eq!(commands[3], ["controller", "cleanup"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn destroy_skips_egress_cleanup_for_non_allowlist_boxes() -> Result<()> {
+    let host = ScriptedHost::silent();
+    let sandbox = DockerSandbox::new(host.clone(), Arc::new(MemoryStore::new()))
+        .with_egress_controller(Arc::new(RecordingEgressController));
+    let info = sandbox.create(&spec()?).await?;
+
+    sandbox.destroy(&info.id).await?;
+
+    assert!(
+        !host
+            .commands()
+            .iter()
+            .any(|command| command.first().is_some_and(|word| word == "controller"))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn destroying_persisted_allowlist_without_controller_refuses_before_removal() -> Result<()> {
+    let host = ScriptedHost::silent();
+    let store = Arc::new(MemoryStore::new());
+    let sandbox = DockerSandbox::new(host.clone(), store.clone())
+        .with_egress_controller(Arc::new(RecordingEgressController));
+    let allowlist = tinybox_core::EgressAllowlist::new(["api.example.test"], [443]);
+    let info = sandbox
+        .create(&spec()?.with_network(NetworkPolicy::Allowlist(allowlist)))
+        .await?;
+    let commands_before_destroy = host.commands();
+    let reconstructed = DockerSandbox::new(host.clone(), store.clone());
+
+    assert!(matches!(
+        reconstructed.destroy(&info.id).await,
+        Err(Error::ConstraintNotEnforced {
+            constraint: tinybox_core::Constraint::Network,
+            enforcement: tinybox_core::Enforcement::Unsupported,
+            ..
+        })
+    ));
+    assert_eq!(host.commands(), commands_before_destroy);
+    assert_eq!(store.list()?.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn controller_host_forwards_host_capabilities_and_pins_docker_commands() -> Result<()> {
+    let inner = ScriptedHost::silent();
+    let host = super::ControllerHost {
+        inner: inner.clone(),
+        controller: Arc::new(RecordingEgressController),
+    };
+
+    assert_eq!(host.name(), "scripted");
+    assert_eq!(host.execution_location(), HostExecutionLocation::Unknown);
+    assert!(!host.has_pending_observed_cleanup());
+    host.retry_observed_cleanup().await?;
+    assert!(matches!(
+        host.open_workspace_file(
+            std::path::Path::new("/workspace"),
+            std::path::Path::new("file")
+        )
+        .await,
+        Err(Error::UnsupportedHostFileTransfer { .. })
+    ));
+    assert!(matches!(
+        host.begin_workspace_file_write(
+            std::path::Path::new("/workspace"),
+            std::path::Path::new("file"),
+            "transfer",
+        )
+        .await,
+        Err(Error::UnsupportedHostFileTransfer { .. })
+    ));
+    assert!(matches!(
+        host.forward(std::net::SocketAddr::from(([127, 0, 0, 1], 1234)))
+            .await,
+        Err(Error::Unsupported { .. })
+    ));
+
+    let observer: Arc<dyn tinybox_core::ExecutionObserver> = Arc::new(CapturingObserver::default());
+    host.run_observed(&ExecRequest::new(["docker", "version"]), observer)
+        .await?;
+    assert_eq!(inner.commands()[0], ["docker", "version"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn missing_controller_during_egress_preparation_rolls_back_reserved_record() -> Result<()> {
+    let (sandbox, _host, store) = sandbox();
+    let id = BoxId::new("box-0")?;
+    let allowlist = tinybox_core::EgressAllowlist::new(["api.example.test"], [443]);
+    let spec = spec()?.with_network(NetworkPolicy::Allowlist(allowlist));
+    assert!(matches!(
+        sandbox.prepare_egress_network(&spec, &id, "attempt").await,
+        Err(Error::ConstraintNotEnforced {
+            constraint: tinybox_core::Constraint::Network,
+            enforcement: tinybox_core::Enforcement::Unsupported,
+            ..
+        })
+    ));
+    assert!(matches!(store.get(&id), Err(Error::UnknownBox { .. })));
+    Ok(())
+}
+
+#[tokio::test]
+async fn controller_failure_rolls_back_before_dropping_the_box_record() -> Result<()> {
+    #[derive(Debug)]
+    struct FailingController;
+
+    #[async_trait]
+    impl super::DockerEgressController for FailingController {
+        async fn prepare(
+            &self,
+            host: &dyn Host,
+            _namespace: &str,
+            _id: &BoxId,
+            _allowlist: &tinybox_core::EgressAllowlist,
+        ) -> Result<crate::PreparedEgressNetwork> {
+            host.run(&ExecRequest::new(["controller", "prepare"]))
+                .await?;
+            host.run(&ExecRequest::new(["controller", "cleanup"]))
+                .await?;
+            Err(Error::ConstraintNotEnforced {
+                sandbox: NAME.to_owned(),
+                constraint: tinybox_core::Constraint::Network,
+                enforcement: tinybox_core::Enforcement::Unsupported,
+            })
+        }
+
+        async fn cleanup(&self, host: &dyn Host, _namespace: &str, _id: &BoxId) -> Result<()> {
+            host.run(&ExecRequest::new(["controller", "cleanup"]))
+                .await?;
+            Ok(())
+        }
+
+        fn docker_argv(&self, argv: Vec<String>) -> Vec<String> {
+            argv
+        }
+    }
+
+    let host = ScriptedHost::silent();
+    let store = Arc::new(MemoryStore::new());
+    let sandbox = DockerSandbox::new(host.clone(), store.clone())
+        .with_egress_controller(Arc::new(FailingController));
+    let allowlist = tinybox_core::EgressAllowlist::new(["api.example.test"], [443]);
+
+    assert!(matches!(
+        sandbox
+            .create(&spec()?.with_network(NetworkPolicy::Allowlist(allowlist)))
+            .await,
+        Err(Error::ConstraintNotEnforced {
+            constraint: tinybox_core::Constraint::Network,
+            enforcement: tinybox_core::Enforcement::Unsupported,
+            ..
+        })
+    ));
+    assert_eq!(store.list()?.len(), 0);
+    assert_eq!(
+        host.commands(),
+        [["controller", "prepare"], ["controller", "cleanup"]]
+    );
+    Ok(())
+}
+
+#[test]
+fn allowlist_run_args_pin_every_resolved_address_and_disable_upstream_dns() -> Result<()> {
+    let id = BoxId::new("box-0")?;
+    let prepared = crate::PreparedEgressNetwork::new(
+        "tinybox-egress-test".to_owned(),
+        vec![
+            (
+                "service.test".to_owned(),
+                std::net::IpAddr::from([203, 0, 113, 8]),
+            ),
+            (
+                "service.test".to_owned(),
+                std::net::IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 8)),
+            ),
+        ],
+    );
+
+    let argv = args::run("test", &id, "attempt", &spec()?, Some(&prepared))?;
+    assert_eq!(flag_value(&argv, "--dns"), Some("127.0.0.1"));
+    assert!(
+        argv.windows(2)
+            .any(|args| { args[0] == "--add-host" && args[1] == "service.test:203.0.113.8" })
+    );
+    assert!(
+        argv.windows(2)
+            .any(|args| { args[0] == "--add-host" && args[1] == "service.test:[2001:db8::8]" })
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_controller_refuses_hosts_without_explicit_local_identity() -> Result<()> {
+    #[derive(Debug)]
+    struct Resolver;
+    impl crate::EgressResolver for Resolver {
+        fn resolve(&self, _hostname: &str) -> std::io::Result<Vec<std::net::IpAddr>> {
+            Ok(vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                203, 0, 113, 7,
+            ))])
+        }
+    }
+
+    let allowlist = tinybox_core::EgressAllowlist::new(["api.example.test"], [443]);
+    for location in [
+        HostExecutionLocation::Unknown,
+        HostExecutionLocation::Remote,
+    ] {
+        let host = Arc::new(ScriptedHost {
+            location: Some(location),
+            ..ScriptedHost::default()
+        });
+        let sandbox = DockerSandbox::new(host.clone(), Arc::new(MemoryStore::new()))
+            .with_egress_controller(Arc::new(crate::NativeLinuxDockerEgressController::new(
+                Arc::new(Resolver),
+            )));
+
+        assert!(matches!(
+            sandbox
+                .create(&spec()?.with_network(NetworkPolicy::Allowlist(allowlist.clone())))
+                .await,
+            Err(Error::ConstraintNotEnforced {
+                constraint: tinybox_core::Constraint::Network,
+                enforcement: tinybox_core::Enforcement::Unsupported,
+                ..
+            })
+        ));
+        assert_eq!(host.commands(), Vec::<Vec<String>>::new());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_egress_rollback_retains_box_record_for_cleanup_retry() -> Result<()> {
+    #[derive(Debug)]
+    struct CleanupFailureController;
+
+    #[async_trait]
+    impl super::DockerEgressController for CleanupFailureController {
+        async fn prepare(
+            &self,
+            _host: &dyn Host,
+            _namespace: &str,
+            _id: &BoxId,
+            _allowlist: &tinybox_core::EgressAllowlist,
+        ) -> Result<crate::PreparedEgressNetwork> {
+            // The controller owns its partial setup rollback. If that rollback
+            // fails, it reports the typed error so the sandbox retains
+            // the box record for a later destroy retry without issuing a
+            // second, potentially unsafe cleanup.
+            Err(Error::EgressRollbackFailed {
+                sandbox: NAME.to_owned(),
+                message: "cleanup failed: filter unavailable".to_owned(),
+            })
+        }
+
+        async fn cleanup(&self, _host: &dyn Host, _namespace: &str, _id: &BoxId) -> Result<()> {
+            Err(Error::Backend {
+                sandbox: NAME.to_owned(),
+                operation: "remove test egress filter",
+                message: "filter unavailable".to_owned(),
+            })
+        }
+
+        fn docker_argv(&self, argv: Vec<String>) -> Vec<String> {
+            argv
+        }
+    }
+
+    let host = ScriptedHost::silent();
+    let store = Arc::new(MemoryStore::new());
+    let sandbox = DockerSandbox::new(host, store.clone())
+        .with_egress_controller(Arc::new(CleanupFailureController));
+    let allowlist = tinybox_core::EgressAllowlist::new(["api.example.test"], [443]);
+
+    assert!(matches!(
+        sandbox
+            .create(&spec()?.with_network(NetworkPolicy::Allowlist(allowlist)))
+            .await,
+        Err(Error::EgressRollbackFailed { message, .. }) if message.contains("cleanup failed")
+    ));
+    assert_eq!(store.list()?.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_create_cleanup_retains_the_record_for_retry() -> Result<()> {
+    #[derive(Debug)]
+    struct CleanupFailureController;
+
+    #[async_trait]
+    impl super::DockerEgressController for CleanupFailureController {
+        async fn prepare(
+            &self,
+            _host: &dyn Host,
+            _namespace: &str,
+            _id: &BoxId,
+            _allowlist: &tinybox_core::EgressAllowlist,
+        ) -> Result<crate::PreparedEgressNetwork> {
+            unreachable!("this test enters the rollback path directly")
+        }
+
+        async fn cleanup(&self, _host: &dyn Host, _namespace: &str, _id: &BoxId) -> Result<()> {
+            Err(Error::Backend {
+                sandbox: NAME.to_owned(),
+                operation: "remove test egress filter",
+                message: "filter unavailable".to_owned(),
+            })
+        }
+
+        fn docker_argv(&self, argv: Vec<String>) -> Vec<String> {
+            argv
+        }
+    }
+
+    let host = ScriptedHost::silent();
+    let store = Arc::new(MemoryStore::new());
+    let sandbox = DockerSandbox::new(host, store.clone())
+        .with_egress_controller(Arc::new(CleanupFailureController));
+    let info = tinybox_core::insert_new(
+        store.as_ref(),
+        BoxState::Ready,
+        &spec()?,
+        std::time::SystemTime::UNIX_EPOCH,
+    )?;
+    let original = Error::Backend {
+        sandbox: NAME.to_owned(),
+        operation: "start test container",
+        message: "start failed".to_owned(),
+    };
+
+    let error = sandbox
+        .rollback_failed_create(&info.id, "attempt", true, original)
+        .await;
+
+    assert!(matches!(
+        error,
+        Error::EgressRollbackFailed { ref message, .. }
+            if message.contains("start failed") && message.contains("filter unavailable")
+    ));
+    assert_eq!(store.list()?.len(), 1);
+    assert_eq!(
+        sandbox
+            .failed_create_attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&info.id)
+            .map(String::as_str),
+        Some("attempt")
+    );
+    Ok(())
+}
 
 #[test]
 fn effective_published_ports_parse_dynamic_and_fixed_bindings() -> Result<()> {
@@ -56,6 +775,8 @@ const COMMIT_OUTPUT: &str =
 struct ScriptedHost {
     replies: Mutex<VecDeque<ExecOutput>>,
     seen: Mutex<Vec<Vec<String>>>,
+    seen_env: Mutex<Vec<BTreeMap<String, String>>>,
+    location: Option<HostExecutionLocation>,
     cancel_observed: AtomicBool,
     refuse_observed: AtomicBool,
     block_observed: AtomicBool,
@@ -71,6 +792,20 @@ impl ScriptedHost {
     /// A host that answers every command with success and no output.
     fn silent() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    fn local() -> Arc<Self> {
+        Arc::new(Self {
+            location: Some(HostExecutionLocation::Local),
+            ..Self::default()
+        })
+    }
+
+    fn remote() -> Arc<Self> {
+        Arc::new(Self {
+            location: Some(HostExecutionLocation::Remote),
+            ..Self::default()
+        })
     }
 
     fn replies(&self) -> MutexGuard<'_, VecDeque<ExecOutput>> {
@@ -105,6 +840,16 @@ impl ScriptedHost {
     fn command(&self, index: usize) -> Option<Vec<String>> {
         self.seen().get(index).cloned()
     }
+
+    /// The environment the nth command's client ran with.
+    fn command_env(&self, index: usize) -> BTreeMap<String, String> {
+        self.seen_env
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(index)
+            .cloned()
+            .unwrap_or_default()
+    }
 }
 
 #[async_trait]
@@ -113,8 +858,16 @@ impl Host for ScriptedHost {
         "scripted"
     }
 
+    fn execution_location(&self) -> HostExecutionLocation {
+        self.location.unwrap_or(HostExecutionLocation::Unknown)
+    }
+
     async fn run(&self, request: &ExecRequest) -> Result<ExecOutput> {
         self.seen().push(request.argv.clone());
+        self.seen_env
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(request.env.clone());
         if request
             .argv
             .iter()
@@ -196,6 +949,10 @@ impl Host for ScriptedHost {
         observer: Arc<dyn tinybox_core::ExecutionObserver>,
     ) -> Result<ExecOutput> {
         self.seen().push(request.argv.clone());
+        self.seen_env
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(request.env.clone());
         if self.refuse_observed.load(Ordering::Acquire) {
             return Err(Error::UnsupportedStreaming {
                 provider: self.name().to_owned(),
@@ -257,6 +1014,7 @@ fn flag_value<'a>(argv: &'a [String], flag: &str) -> Option<&'a str> {
 struct CapturingObserver {
     cancel: bool,
     batches: Mutex<Vec<(tinybox_core::OutputStream, Vec<u8>)>>,
+    causes: Mutex<Vec<tinybox_core::TerminationCause>>,
 }
 
 impl CapturingObserver {
@@ -278,11 +1036,49 @@ impl tinybox_core::ExecutionObserver for CapturingObserver {
         Ok(())
     }
 
+    fn termination_cause(&self, cause: tinybox_core::TerminationCause) {
+        self.causes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(cause);
+    }
+
     async fn cancelled(&self) {
         if !self.cancel {
             std::future::pending::<()>().await;
         }
     }
+}
+
+#[test]
+fn docker_observer_forwards_provider_termination_causes() -> Result<()> {
+    let inner = Arc::new(CapturingObserver::default());
+    let observer = super::DockerExecutionObserver {
+        inner: inner.clone(),
+        host: Arc::new(ScriptedHost::default()),
+        namespace: "fixture".into(),
+        handle: super::CleanupHandle {
+            id: BoxId::new("box-0")?,
+            token: "token".into(),
+            generation: 0,
+            launched: true,
+            acknowledged: Arc::default(),
+            unsupported: Arc::default(),
+        },
+        observed_boxes: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        pending: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        control: Arc::new(super::ObservedControl::default()),
+    };
+
+    tinybox_core::ExecutionObserver::termination_cause(
+        &observer,
+        tinybox_core::TerminationCause::CpuQuota,
+    );
+    assert_eq!(
+        *inner.causes.lock().unwrap_or_else(PoisonError::into_inner),
+        vec![tinybox_core::TerminationCause::CpuQuota]
+    );
+    Ok(())
 }
 
 #[test]
@@ -388,6 +1184,28 @@ async fn creating_a_box_runs_a_detached_named_labelled_container() -> Result<()>
 }
 
 #[tokio::test]
+async fn an_image_that_looks_like_a_flag_stays_a_positional() -> Result<()> {
+    let (sandbox, host, _store) = sandbox();
+
+    sandbox
+        .create(&spec_from(WorkspaceSource::OciImage(
+            "--privileged".to_owned(),
+        ))?)
+        .await?;
+
+    let argv = host.command(0).unwrap_or_default();
+    let image = argv.iter().position(|part| part == "--privileged");
+    assert_eq!(
+        image
+            .and_then(|index| argv.get(index - 1))
+            .map(String::as_str),
+        Some("--"),
+        "{argv:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn the_container_is_held_open_so_commands_have_somewhere_to_land() -> Result<()> {
     let (sandbox, host, _store) = sandbox();
 
@@ -459,13 +1277,54 @@ async fn a_local_directory_is_bind_mounted_and_becomes_the_working_directory() -
 }
 
 #[tokio::test]
+async fn audit_high2_a_dangerous_local_directory_is_refused_before_any_record() -> Result<()> {
+    let (sandbox, host, store) = sandbox();
+
+    for path in ["/", "/etc", "/var/run"] {
+        let outcome = sandbox
+            .create(&spec_from(WorkspaceSource::LocalDir(path.into()))?)
+            .await;
+        assert_eq!(
+            outcome.err(),
+            Some(Error::UnsupportedWorkspaceSource {
+                sandbox: NAME.to_owned(),
+                kind: "dangerous host directory",
+            }),
+            "{path}"
+        );
+    }
+    assert_eq!(store.list()?.len(), 0);
+    assert!(host.command(0).is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_persistent_box_cannot_gain_new_privileges() -> Result<()> {
+    let (sandbox, host, _store) = sandbox();
+
+    sandbox.create(&spec()?).await?;
+
+    let argv = host.command(0).unwrap_or_default();
+    assert_eq!(
+        flag_value(&argv, "--security-opt"),
+        Some("no-new-privileges")
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn box_environment_reaches_the_container() -> Result<()> {
     let (sandbox, host, _store) = sandbox();
 
     sandbox.create(&spec()?.with_env("CI", "true")).await?;
 
     let argv = host.command(0).unwrap_or_default();
-    assert_eq!(flag_value(&argv, "--env"), Some("CI=true"));
+    assert_eq!(flag_value(&argv, "--env"), Some("CI"));
+    assert!(!argv.iter().any(|arg| arg == "CI=true"), "{argv:?}");
+    assert_eq!(
+        host.command_env(0).get("CI").map(String::as_str),
+        Some("true")
+    );
     Ok(())
 }
 
@@ -669,7 +1528,9 @@ async fn a_command_carries_its_working_directory_and_environment() -> Result<()>
 
     let argv = host.command(2).unwrap_or_default();
     assert_eq!(flag_value(&argv, "--workdir"), Some("/tmp"));
-    assert_eq!(flag_value(&argv, "--env"), Some("K=v"));
+    assert_eq!(flag_value(&argv, "--env"), Some("K"));
+    assert!(!argv.iter().any(|arg| arg == "K=v"), "{argv:?}");
+    assert_eq!(host.command_env(2).get("K").map(String::as_str), Some("v"));
     Ok(())
 }
 
@@ -1677,5 +2538,22 @@ async fn an_unenforceable_network_allowlist_is_refused_at_creation() -> Result<(
             ..
         })
     ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_unsupported_hard_requirement_is_refused_before_storage() -> Result<()> {
+    let (sandbox, _host, store) = sandbox();
+    let requested = spec()?.with_hard_requirements([tinybox_core::Constraint::Disk]);
+
+    assert!(matches!(
+        sandbox.create(&requested).await,
+        Err(Error::ConstraintNotEnforced {
+            constraint: tinybox_core::Constraint::Disk,
+            enforcement: tinybox_core::Enforcement::Unsupported,
+            ..
+        })
+    ));
+    assert_eq!(store.list()?, []);
     Ok(())
 }

@@ -293,6 +293,8 @@ crates/
 │   └── tests/live_ssh.rs    # gated behind TINYBOX_LIVE_SSH
 ├── tinybox-linux/           # confinement: rootless namespaces, no daemon
 │   └── tests/live_namespaces.rs # gated behind TINYBOX_LIVE_NAMESPACES
+├── tinybox-openshell/       # confinement: NVIDIA OpenShell sandboxes behind a gateway
+│   └── src/sandbox/args.rs  # pure `openshell sandbox` command construction
 ├── tinybox-sync/            # fingerprinting, exclusions, tar-over-stdin transfer
 ├── tinybox-cli/             # the `tinybox` binary
 │   ├── src/command/         # argument parsing and dispatch
@@ -407,8 +409,12 @@ that is `tinysecurity`. See `docs/specs/contract-1-19.md`.
 
 ## Docker one-shot lifecycle
 
-Contract 2.1 preserves the host's non-root workspace identity and process limit
-inside TinyBox. Timeout cleanup addresses only the invocation's unique container
-and reports whether stopping it succeeded; dropping the caller's wait does not
-abandon supervision. See [contract 2.1](docs/specs/contract-2-1.md) for cleanup,
-output bounds and the optional result evidence fields.
+This fork carries a Docker one-shot extension inside contract 2.3. It is not
+upstream's contract 2.1 (the resource-aware native jail members), and no contract
+version number detects it. It preserves the host's non-root workspace identity and
+process limit inside TinyBox. Timeout cleanup addresses only the invocation's
+unique container and reports whether stopping it succeeded; dropping the caller's
+wait does not abandon supervision. Hosts must treat absent `killed` evidence on a
+timed-out result as unknown cleanup, never as a confirmed stop. See
+[the fork Docker extension](docs/specs/contract-2-1.md) for cleanup, output bounds
+and the optional result evidence fields.

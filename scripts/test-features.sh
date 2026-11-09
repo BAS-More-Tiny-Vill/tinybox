@@ -45,6 +45,7 @@ esac
 python3 scripts/test-e2e-version.py
 cargo test --locked --workspace
 cargo test --locked --workspace --all-features
+python3 scripts/check-library-engines.py
 case "${RUNNER_OS:-$(uname -s)}" in
   Windows|MINGW*|MSYS*|CYGWIN*) ;;
   *)

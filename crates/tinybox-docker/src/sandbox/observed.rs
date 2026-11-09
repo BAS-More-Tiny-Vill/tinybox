@@ -178,6 +178,7 @@ pub(super) fn exec(
     argv.extend(request.argv.iter().cloned());
 
     let mut observed = ExecRequest::new(argv);
+    observed.env.clone_from(&request.env);
     if let Some(stdin) = &request.stdin {
         observed = observed.with_stdin(stdin.clone());
     }

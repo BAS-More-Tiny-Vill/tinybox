@@ -1,14 +1,18 @@
-//! A document store that fails on demand, for the error paths.
+//! A document port decorator that uses the testkit's shared failure schedule.
 //!
 //! Compiled only for tests; the happy paths use `MemoryStorage` directly.
 
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use async_trait::async_trait;
 use serde_json::Value;
-use tinystoragedrivers_core::{
-    Capabilities, CollectionSpec, DocumentStore, Filter, Page, Precondition, Query, Sort,
-    StorageError, Version, Versioned, WriteOptions, async_trait,
+use tinystoragedrivers_api::DocumentStore;
+use tinystoragedrivers_testkit::Failing;
+use tinystoragedrivers_types::{
+    Capabilities, CollectionSpec, ErrorKind, Filter, Page, Precondition, Query, Sort, StorageError,
+    Version, Versioned, WriteOptions,
 };
 
 type Result<T> = std::result::Result<T, StorageError>;
@@ -31,30 +35,140 @@ pub(crate) struct Faults {
 #[derive(Debug)]
 pub(crate) struct Faulty {
     pub(crate) inner: Arc<dyn DocumentStore>,
-    pub(crate) faults: Faults,
+    pub(crate) failing: Failing<dyn DocumentStore>,
     pub(crate) conflicts: AtomicUsize,
+    fail_target_readback: bool,
+    target_written: std::sync::atomic::AtomicBool,
+    source_replacement: Mutex<Option<(String, Value)>>,
+    target_replacement: Mutex<Option<(String, Value)>>,
+    receipt_race: std::sync::atomic::AtomicBool,
+    /// Like a host that owns the schema: declaring any collection outside this
+    /// list is refused.
+    grant: Option<Vec<String>>,
 }
 
 impl Faulty {
     pub(crate) fn new(inner: Arc<dyn DocumentStore>, faults: Faults) -> Arc<Self> {
+        let failing = Failing::new(Arc::clone(&inner));
+        for (enabled, operation) in [
+            (faults.ensure, "ensure"),
+            (faults.get, "get"),
+            (faults.put, "put"),
+            (faults.delete, "delete"),
+            (faults.query, "query"),
+        ] {
+            if enabled {
+                failing
+                    .faults
+                    .fail_operation_nth(operation, 1, ErrorKind::Backend);
+            }
+        }
         Arc::new(Self {
             inner,
-            faults,
+            failing,
             conflicts: AtomicUsize::new(0),
+            fail_target_readback: false,
+            target_written: std::sync::atomic::AtomicBool::new(false),
+            source_replacement: Mutex::new(None),
+            target_replacement: Mutex::new(None),
+            receipt_race: std::sync::atomic::AtomicBool::new(false),
+            grant: None,
         })
     }
 
     pub(crate) fn with_conflicts(inner: Arc<dyn DocumentStore>, conflicts: usize) -> Arc<Self> {
         Arc::new(Self {
+            failing: Failing::new(Arc::clone(&inner)),
             inner,
-            faults: Faults::default(),
             conflicts: AtomicUsize::new(conflicts),
+            fail_target_readback: false,
+            target_written: std::sync::atomic::AtomicBool::new(false),
+            source_replacement: Mutex::new(None),
+            target_replacement: Mutex::new(None),
+            receipt_race: std::sync::atomic::AtomicBool::new(false),
+            grant: None,
         })
     }
-}
 
-fn boom(what: &str) -> StorageError {
-    StorageError::backend(format!("injected {what} failure"))
+    pub(crate) fn failing_target_readback(inner: Arc<dyn DocumentStore>) -> Arc<Self> {
+        Arc::new(Self {
+            failing: Failing::new(Arc::clone(&inner)),
+            inner,
+            conflicts: AtomicUsize::new(0),
+            fail_target_readback: true,
+            target_written: std::sync::atomic::AtomicBool::new(false),
+            source_replacement: Mutex::new(None),
+            target_replacement: Mutex::new(None),
+            receipt_race: std::sync::atomic::AtomicBool::new(false),
+            grant: None,
+        })
+    }
+
+    pub(crate) fn changing_source_after_target_write(
+        inner: Arc<dyn DocumentStore>,
+        source_id: String,
+        replacement: Value,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            failing: Failing::new(Arc::clone(&inner)),
+            inner,
+            conflicts: AtomicUsize::new(0),
+            fail_target_readback: false,
+            target_written: std::sync::atomic::AtomicBool::new(false),
+            source_replacement: Mutex::new(Some((source_id, replacement))),
+            target_replacement: Mutex::new(None),
+            receipt_race: std::sync::atomic::AtomicBool::new(false),
+            grant: None,
+        })
+    }
+
+    pub(crate) fn changing_target_after_write(
+        inner: Arc<dyn DocumentStore>,
+        target_id: String,
+        replacement: Value,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            failing: Failing::new(Arc::clone(&inner)),
+            inner,
+            conflicts: AtomicUsize::new(0),
+            fail_target_readback: false,
+            target_written: std::sync::atomic::AtomicBool::new(false),
+            source_replacement: Mutex::new(None),
+            target_replacement: Mutex::new(Some((target_id, replacement))),
+            receipt_race: std::sync::atomic::AtomicBool::new(false),
+            grant: None,
+        })
+    }
+
+    /// Refuses to declare any collection but `granted`, as a host that owns
+    /// the module's schema does (`schema-is-host-only`).
+    pub(crate) fn granting(inner: Arc<dyn DocumentStore>, granted: &[&str]) -> Arc<Self> {
+        Arc::new(Self {
+            failing: Failing::new(Arc::clone(&inner)),
+            inner,
+            conflicts: AtomicUsize::new(0),
+            fail_target_readback: false,
+            target_written: std::sync::atomic::AtomicBool::new(false),
+            source_replacement: Mutex::new(None),
+            target_replacement: Mutex::new(None),
+            receipt_race: std::sync::atomic::AtomicBool::new(false),
+            grant: Some(granted.iter().map(|name| (*name).to_owned()).collect()),
+        })
+    }
+
+    pub(crate) fn racing_receipt(inner: Arc<dyn DocumentStore>) -> Arc<Self> {
+        Arc::new(Self {
+            failing: Failing::new(Arc::clone(&inner)),
+            inner,
+            conflicts: AtomicUsize::new(0),
+            fail_target_readback: false,
+            target_written: std::sync::atomic::AtomicBool::new(false),
+            source_replacement: Mutex::new(None),
+            target_replacement: Mutex::new(None),
+            receipt_race: std::sync::atomic::AtomicBool::new(true),
+            grant: None,
+        })
+    }
 }
 
 #[async_trait]
@@ -64,17 +178,26 @@ impl DocumentStore for Faulty {
     }
 
     async fn ensure_collection(&self, spec: &CollectionSpec) -> Result<()> {
-        if self.faults.ensure {
-            return Err(boom("ensure"));
+        if let Some(grant) = &self.grant
+            && !grant.contains(&spec.name)
+        {
+            return Err(StorageError::invalid_input("schema-is-host-only"));
         }
-        self.inner.ensure_collection(spec).await
+        self.failing
+            .call("ensure", self.inner.ensure_collection(spec))
+            .await
     }
 
     async fn get(&self, collection: &str, id: &str) -> Result<Option<Versioned<Value>>> {
-        if self.faults.get {
-            return Err(boom("get"));
+        if collection == tinybox_bus::storage::BOX_COLLECTION
+            && self.fail_target_readback
+            && self.target_written.swap(false, Ordering::SeqCst)
+        {
+            return Err(StorageError::backend("injected target readback failure"));
         }
-        self.inner.get(collection, id).await
+        self.failing
+            .call("get", self.inner.get(collection, id))
+            .await
     }
 
     async fn put(
@@ -96,8 +219,14 @@ impl DocumentStore for Faulty {
         precondition: Precondition,
         options: WriteOptions,
     ) -> Result<Version> {
-        if self.faults.put {
-            return Err(boom("put"));
+        if collection == tinybox_bus::storage::MIGRATIONS_COLLECTION
+            && self.receipt_race.swap(false, Ordering::SeqCst)
+            && matches!(precondition, Precondition::Absent)
+        {
+            self.inner
+                .put_with(collection, id, doc, precondition, options)
+                .await?;
+            return Err(StorageError::conflict("injected concurrent receipt write"));
         }
         if matches!(precondition, Precondition::Version(_)) {
             let left = self.conflicts.load(Ordering::SeqCst);
@@ -108,23 +237,69 @@ impl DocumentStore for Faulty {
                 return Err(StorageError::conflict("injected conflict"));
             }
         }
-        self.inner
-            .put_with(collection, id, doc, precondition, options)
-            .await
+        let version = self
+            .failing
+            .call(
+                "put",
+                self.inner
+                    .put_with(collection, id, doc, precondition, options),
+            )
+            .await?;
+        if collection == tinybox_bus::storage::BOX_COLLECTION {
+            self.target_written.store(true, Ordering::SeqCst);
+            let replacement = self
+                .target_replacement
+                .lock()
+                .expect("target replacement mutex")
+                .take();
+            if let Some((target_id, body)) = replacement
+                && let Some(target) = self.inner.get(collection, &target_id).await?
+            {
+                self.inner
+                    .put_with(
+                        collection,
+                        &target_id,
+                        body,
+                        Precondition::Version(target.version),
+                        options,
+                    )
+                    .await?;
+            }
+            let replacement = self
+                .source_replacement
+                .lock()
+                .expect("source replacement mutex")
+                .take();
+            if let Some((source_id, body)) = replacement
+                && let Some(source) = self
+                    .inner
+                    .get(tinybox_bus::storage::V1_BOX_COLLECTION, &source_id)
+                    .await?
+            {
+                self.inner
+                    .put_with(
+                        tinybox_bus::storage::V1_BOX_COLLECTION,
+                        &source_id,
+                        body,
+                        Precondition::Version(source.version),
+                        WriteOptions::default(),
+                    )
+                    .await?;
+            }
+        }
+        Ok(version)
     }
 
     async fn delete(&self, collection: &str, id: &str, precondition: Precondition) -> Result<bool> {
-        if self.faults.delete {
-            return Err(boom("delete"));
-        }
-        self.inner.delete(collection, id, precondition).await
+        self.failing
+            .call("delete", self.inner.delete(collection, id, precondition))
+            .await
     }
 
     async fn query(&self, collection: &str, query: &Query) -> Result<Page<Versioned<Value>>> {
-        if self.faults.query {
-            return Err(boom("query"));
-        }
-        self.inner.query(collection, query).await
+        self.failing
+            .call("query", self.inner.query(collection, query))
+            .await
     }
 
     async fn count(&self, collection: &str, filter: &Filter) -> Result<u64> {

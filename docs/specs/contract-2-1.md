@@ -1,4 +1,13 @@
-# Contract 2.1: supervised Docker one-shot execution
+# Fork extension (carried inside contract 2.3): supervised Docker one-shot execution
+
+This document describes a fork-only extension to the Docker one-shot members.
+It is not upstream's contract 2.1, which adds the resource-aware native jail
+members (`NATIVE_JAIL_RESOURCES_VERSION`, see the module README). The merged
+module advertises contract 2.3, and these guarantees ride inside it as additive,
+optional result fields. No contract version number identifies them: an
+unmodified upstream module at 2.1, 2.2 or 2.3 passes the same version check
+without providing any of the guarantees below. The file name is kept for link
+stability only.
 
 `RunDocker` and `RunDockerWithoutWorkspace` keep their request shapes. Their
 one-shot containers always drop all capabilities, prohibit privilege escalation,
@@ -26,9 +35,13 @@ host capture memory as well as the returned result.
   requested time limit.
 
 `timed_out` means a deadline expired; it alone cannot prove that anything stopped.
-Hosts must retain failed/unknown cleanup evidence in their error messages. Older
-wire results deserialize with absent evidence, but a host requiring this contract
-must admit version 2.1 or newer of major version 2 before execution.
+Hosts must not gate on the contract version to obtain these guarantees, because
+the version cannot detect the extension. Instead, a host must treat absent or
+null `killed` on a timed-out result as unknown cleanup, never as a confirmed
+stop, and must treat `killed == false` as a failed stop. Hosts must retain
+failed or unknown cleanup evidence in their error messages. Older wire results,
+and results from modules without this extension, deserialize with absent
+evidence and therefore read as unknown.
 
 Host policy still decides which configurable network and root-filesystem settings
 are allowed. OpenHuman's sandbox policy permits only network `none` and a read-only

@@ -44,11 +44,18 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security_Isolation",
     "Win32_Storage_FileSystem",
     "Win32_System_Memory",
+    "Win32_System_JobObjects",
+    "Win32_System_Pipes",
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
 ] }
 
 [dev-dependencies]
 tempfile = "3"
+tinystoragedrivers-api.workspace = true
+tinystoragedrivers-testkit.workspace = true
+tinystoragedrivers-types.workspace = true
+tokio.workspace = true
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 # Clears close-on-exec on a descriptor in the fd-leak regression test; the safe

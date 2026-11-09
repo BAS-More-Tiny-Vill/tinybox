@@ -19,11 +19,11 @@ mod grants;
 pub use grants::{LocalGrantConfig, LocalGrants, ProtectedPaths, ResolveLocalGrantsRequest};
 
 mod jail;
-pub use jail::{JailEnforcement, NativeJailConfig};
+pub use jail::{JailEnforcement, NativeJailConfig, NativeJailRequest, NativeJailResourceRequest};
 
 mod shell_execution;
 mod shell_selection;
-pub use shell_execution::ShellExecRequest;
+pub use shell_execution::{RunNativeShellRequest, RunNativeShellResult, ShellExecRequest};
 pub use shell_selection::{SelectShellRequest, ShellFlavor, ShellInvocation};
 
 mod stdio;
@@ -39,7 +39,7 @@ mod policy;
 pub use policy::{DockerPolicyReport, DockerPolicyRequest};
 
 mod event;
-pub use event::{DenialKind, EgressAllowlist, LimitKind, SandboxEvent};
+pub use event::{DenialKind, EgressAllowlist, LimitKind, ProcessEvent, SandboxEvent};
 
 mod files;
 pub use files::{
@@ -82,7 +82,28 @@ pub use files::{
 /// 2.0 removes TinyBox-owned command policy classification and the
 /// `AnalyzeShell.hidden_execution` policy signal. Generic shell structure facts
 /// and transport helpers remain.
-pub const CONTRACT_VERSION: (u32, u32) = (2, 1);
+/// 2.1 adds separate resource-aware native jail request members without
+/// changing the 2.0 Rust request shapes. 2.2 adds process-scoped lifecycle
+/// events for module-owned executions and timeout observations. 2.3 adds
+/// module-owned native-shell orchestration through completion or yield, and
+/// the `openshell` sandbox backend for `Create`.
+///
+/// Fork extension carried inside 2.3: the optional [`DockerRunOutput`]
+/// `killed` and `duration_ms` evidence fields from this fork's Docker
+/// one-shot extension (docs/specs/contract-2-1.md; not upstream's 2.1). They
+/// are additive, default to `None` when a module omits them, and no contract
+/// version identifies them.
+pub const CONTRACT_VERSION: (u32, u32) = (2, 3);
+
+/// Minimum contract version required for resource-aware native jail members.
+pub const NATIVE_JAIL_RESOURCES_VERSION: (u32, u32) = (2, 1);
+
+/// Whether a module explicitly advertises support for the resource-aware
+/// native jail members. Hosts must check this before sending a 2.1 request.
+#[must_use]
+pub fn supports_native_jail_resources(module: (u32, u32)) -> bool {
+    module.0 == NATIVE_JAIL_RESOURCES_VERSION.0 && module.1 >= NATIVE_JAIL_RESOURCES_VERSION.1
+}
 
 /// Whether this host vocabulary can bind to a module's advertised version.
 /// The major must match and the module's minor must include every host member.
@@ -193,6 +214,8 @@ pub mod names {
     pub const START_SHELL_EXEC: &str = "StartShellExec";
     /// Wire name of the `StartNativeShellExec` member.
     pub const START_NATIVE_SHELL_EXEC: &str = "StartNativeShellExec";
+    /// Wire name of the module-owned native-shell lifecycle member.
+    pub const RUN_NATIVE_SHELL: &str = "RunNativeShell";
     /// Wire name of the `ValidateDockerPolicy` member.
     pub const VALIDATE_DOCKER_POLICY: &str = "ValidateDockerPolicy";
     /// Wire name of the `StartStdio` member.
@@ -207,7 +230,14 @@ pub mod names {
     pub const KILL_STDIO: &str = "KillStdio";
     /// Wire name of the `StdioStatus` member.
     pub const STDIO_STATUS: &str = "StdioStatus";
+    /// Wire name of the 2.1 resource-aware jailed exec member.
+    pub const START_JAILED_EXEC_WITH_RESOURCES: &str = "StartJailedExecWithResources";
+    /// Wire name of the process-scoped sandbox lifecycle signal.
+    pub const PROCESS_EVENT: &str = "ProcessEvent";
 }
+
+/// Supported signals in this contract.
+pub const SIGNALS: &[&str] = &[names::PROCESS_EVENT];
 
 /// Supported methods in this contract, including the original discovery
 /// operation. Derived from [`names`]; the order is stable within this major.
@@ -253,6 +283,8 @@ pub const METHODS: &[&str] = &[
     names::CLOSE_STDIN,
     names::KILL_STDIO,
     names::STDIO_STATUS,
+    names::START_JAILED_EXEC_WITH_RESOURCES,
+    names::RUN_NATIVE_SHELL,
 ];
 
 /// Facts about the detected native directory-jail backend.
@@ -523,9 +555,11 @@ pub struct DockerRunOutput {
     /// Whether the command exceeded its deadline; this alone does not prove a stop.
     pub timed_out: bool,
     /// Whether Docker confirmed targeted timeout cleanup. Older modules omit it.
+    /// Fork extension carried inside contract 2.3; optional and additive.
     #[serde(default)]
     pub killed: Option<bool>,
     /// Observed elapsed milliseconds, including bounded cleanup; never a requested limit.
+    /// Fork extension carried inside contract 2.3; optional and additive.
     #[serde(default)]
     pub duration_ms: Option<u64>,
 }

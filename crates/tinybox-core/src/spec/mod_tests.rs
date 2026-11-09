@@ -99,6 +99,20 @@ fn environment_order_does_not_change_spec_identity() -> Result<()> {
 }
 
 #[test]
+fn older_specs_default_hard_requirements_to_empty()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let mut value = serde_json::to_value(spec()?)?;
+    let Some(object) = value.as_object_mut() else {
+        return Err(std::io::Error::other("BoxSpec must serialize as an object").into());
+    };
+    object.remove("hard_requirements");
+
+    let restored: BoxSpec = serde_json::from_value(value)?;
+    assert_eq!(restored.hard_requirements, []);
+    Ok(())
+}
+
+#[test]
 fn validate_rejects_each_zero_limit_in_turn() -> Result<()> {
     for (limit, resources) in [
         (
@@ -228,9 +242,59 @@ fn allowlist_validation_rejects_malformed_and_metadata_hosts() {
     );
     for host in [
         "169.254.169.254",
+        "0251.0376.0251.0376",
+        "0xa9fea9fe",
+        "0xa9feaa02",
+        "0x646464c8",
         "[fd00:ec2::254]",
         "Metadata.Google.Internal",
+        "metadata.google.internal.",
+        "Metadata.Google.Internal.",
+        "metadata.",
     ] {
+        assert!(
+            EgressAllowlist::new([host], [80]).validate().is_err(),
+            "{host} must be refused"
+        );
+    }
+}
+
+#[test]
+fn allowlist_validation_rejects_loopback_targets() {
+    use super::EgressAllowlist;
+
+    for host in [
+        "127.0.0.1",
+        "[::1]",
+        "[::ffff:127.0.0.1]",
+        "localhost",
+        "LOCALHOST.",
+        "service.localhost",
+    ] {
+        assert!(
+            EgressAllowlist::new([host], [80]).validate().is_err(),
+            "{host} must be refused"
+        );
+    }
+}
+
+#[test]
+fn allowlist_validation_rejects_legacy_numeric_loopback_targets() {
+    use super::EgressAllowlist;
+
+    for host in ["127.1", "2130706433", "0x7f000001", "0177.0.0.1"] {
+        assert!(
+            EgressAllowlist::new([host], [80]).validate().is_err(),
+            "{host} must be refused"
+        );
+    }
+}
+
+#[test]
+fn allowlist_validation_rejects_scoped_ipv6_loopback_targets() {
+    use super::EgressAllowlist;
+
+    for host in ["::1%1", "[::1%1]"] {
         assert!(
             EgressAllowlist::new([host], [80]).validate().is_err(),
             "{host} must be refused"

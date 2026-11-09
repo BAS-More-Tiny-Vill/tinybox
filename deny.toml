@@ -7,11 +7,6 @@ all-features = true
 [advisories]
 # Fail on any crate with a security advisory or an unmaintained warning.
 # Add an entry here only with a comment explaining the exposure and the plan.
-# The three `zip` advisories below concern `ZipArchive::extract` and
-# `ZipStreamReader::extract`. zip arrives only through tinybus (vendored), and
-# nothing in this workspace or vendor/tinybus calls an extract API (checked by
-# grep). Remove when tinybus moves to zip >= 9.
-ignore = ["RUSTSEC-2026-0367", "RUSTSEC-2026-0368", "RUSTSEC-2026-0369"]
 
 [licenses]
 # Licenses accepted for this crate and its dependencies. Keep GPL-3.0-only for
@@ -44,5 +39,7 @@ unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # `tinybox-drivers` (never published) takes the storage ports from the
-# tinystoragedrivers repository by tag.
-allow-git = ["https://github.com/tinyhumansai/tinystoragedrivers"]
+# canonical tinystoragedrivers v2.1 commit.
+allow-git = [
+    "https://github.com/tinyhumansai/tinystoragedrivers",
+]

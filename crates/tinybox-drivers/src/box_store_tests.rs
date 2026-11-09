@@ -3,14 +3,35 @@ use crate::faulty::{Faults, Faulty};
 use serde_json::json;
 use tinybox_core::store::insert_new;
 use tinybox_core::{BoxSpec, HostRef, Placement, SandboxRef, WorkspaceSource};
-use tinystoragedrivers_core::{DocumentStore, MemoryStorage, Precondition, Scope, StorageBackend};
+use tinystoragedrivers_api::DocumentStore;
+use tinystoragedrivers_testkit::memory_storage;
+use tinystoragedrivers_types::{CollectionSpec, Precondition, Scope, StorageError};
 
 fn documents() -> Arc<dyn DocumentStore> {
-    MemoryStorage::new()
-        .for_scope(&Scope::local())
-        .expect("scope")
+    memory_storage(&Scope::new("tinybox-tests").expect("scope"))
         .documents()
         .clone()
+}
+
+fn test_store(docs: Arc<dyn DocumentStore>) -> Result<DocumentBoxStore> {
+    let bridge = Blocking::new().expect("bridge");
+    let ensure_docs = Arc::clone(&docs);
+    bridge
+        .run(async move {
+            for declaration in tinybox_bus::storage::collections() {
+                ensure_docs
+                    .ensure_collection(&CollectionSpec::new(declaration.name))
+                    .await?;
+            }
+            Ok::<_, StorageError>(())
+        })
+        .expect("bridge")
+        .expect("collections");
+    let boxes = Repo::new(&docs, BOX_COLLECTION)
+        .map_err(|error| store_error("test", &error))?
+        .with_options(WriteOptions::new().schema(BODY_VERSION));
+    drop(docs);
+    Ok(DocumentBoxStore { boxes, bridge })
 }
 
 fn spec() -> Result<BoxSpec> {
@@ -27,7 +48,7 @@ fn info(id: &str) -> Result<BoxInfo> {
 
 #[test]
 fn an_inserted_box_round_trips() -> Result<()> {
-    let store = DocumentBoxStore::new(documents())?;
+    let store = test_store(documents())?;
     let original = info("build-1")?;
     store.insert(&original)?;
     assert_eq!(store.get(&original.id)?, original);
@@ -37,7 +58,7 @@ fn an_inserted_box_round_trips() -> Result<()> {
 
 #[test]
 fn a_second_insert_of_one_id_is_a_duplicate() -> Result<()> {
-    let store = DocumentBoxStore::new(documents())?;
+    let store = test_store(documents())?;
     store.insert(&info("a")?)?;
     assert!(matches!(
         store.insert(&info("a")?),
@@ -48,7 +69,7 @@ fn a_second_insert_of_one_id_is_a_duplicate() -> Result<()> {
 
 #[test]
 fn an_unknown_box_is_reported_by_every_operation() -> Result<()> {
-    let store = DocumentBoxStore::new(documents())?;
+    let store = test_store(documents())?;
     let id = BoxId::new("ghost")?;
     assert!(matches!(store.get(&id), Err(Error::UnknownBox { .. })));
     assert!(matches!(
@@ -61,7 +82,7 @@ fn an_unknown_box_is_reported_by_every_operation() -> Result<()> {
 
 #[test]
 fn set_state_and_remove_change_the_record() -> Result<()> {
-    let store = DocumentBoxStore::new(documents())?;
+    let store = test_store(documents())?;
     let record = info("a")?;
     store.insert(&record)?;
     store.set_state(&record.id, BoxState::Stopped)?;
@@ -73,7 +94,7 @@ fn set_state_and_remove_change_the_record() -> Result<()> {
 
 #[test]
 fn list_is_ordered_by_identifier() -> Result<()> {
-    let store = DocumentBoxStore::new(documents())?;
+    let store = test_store(documents())?;
     for id in ["c", "a", "b"] {
         store.insert(&info(id)?)?;
     }
@@ -88,7 +109,7 @@ fn list_is_ordered_by_identifier() -> Result<()> {
 
 #[test]
 fn allocation_takes_the_lowest_free_name() -> Result<()> {
-    let store = DocumentBoxStore::new(documents())?;
+    let store = test_store(documents())?;
     let first = insert_new(&store, BoxState::Ready, &spec()?, std::time::UNIX_EPOCH)?;
     let second = insert_new(&store, BoxState::Ready, &spec()?, std::time::UNIX_EPOCH)?;
     assert_eq!(first.id.as_str(), "box-0");
@@ -98,7 +119,7 @@ fn allocation_takes_the_lowest_free_name() -> Result<()> {
 
 #[test]
 fn concurrent_allocation_never_loses_or_repeats_a_box() -> Result<()> {
-    let store = Arc::new(DocumentBoxStore::new(documents())?);
+    let store = Arc::new(test_store(documents())?);
     let handles: Vec<_> = (0..8)
         .map(|_| {
             let store = Arc::clone(&store);
@@ -124,7 +145,7 @@ fn concurrent_allocation_never_loses_or_repeats_a_box() -> Result<()> {
 
 #[test]
 fn concurrent_state_changes_on_different_boxes_all_land() -> Result<()> {
-    let store = Arc::new(DocumentBoxStore::new(documents())?);
+    let store = Arc::new(test_store(documents())?);
     for id in ["a", "b", "c", "d"] {
         store.insert(&info(id)?)?;
     }
@@ -147,7 +168,7 @@ fn concurrent_state_changes_on_different_boxes_all_land() -> Result<()> {
 #[test]
 fn a_document_that_does_not_decode_is_a_store_error() -> Result<()> {
     let docs = documents();
-    let store = DocumentBoxStore::new(Arc::clone(&docs))?;
+    let store = test_store(Arc::clone(&docs))?;
     let bridge = Blocking::new().expect("bridge");
     let writer = Arc::clone(&docs);
     bridge
@@ -174,17 +195,19 @@ fn a_document_that_does_not_decode_is_a_store_error() -> Result<()> {
 }
 
 #[test]
-fn it_works_from_inside_a_current_thread_runtime() -> Result<()> {
-    let runtime = std::thread::spawn(|| -> Result<()> {
-        let runtime = tokio_rt();
-        runtime.block_on(async {
-            let store = DocumentBoxStore::new(documents())?;
-            store.insert(&info("a")?)?;
-            assert_eq!(store.list()?.len(), 1);
-            Ok(())
+fn synchronous_store_calls_fail_from_a_current_thread_runtime() -> Result<()> {
+    let store = test_store(documents())?;
+    let runtime = tokio_rt();
+    let refused = runtime.block_on(async { store.insert(&info("a")?) });
+    assert!(matches!(
+        refused,
+        Err(Error::Store {
+            operation: "insert",
+            ..
         })
-    });
-    runtime.join().expect("thread")
+    ));
+    assert_eq!(store.list()?, Vec::<BoxInfo>::new());
+    Ok(())
 }
 
 fn tokio_rt() -> tokio::runtime::Runtime {
@@ -197,10 +220,9 @@ fn tokio_rt() -> tokio::runtime::Runtime {
 fn backend_failures_surface_as_store_errors_per_operation() -> Result<()> {
     let seeded = documents();
     let record = info("a")?;
-    DocumentBoxStore::new(Arc::clone(&seeded))?.insert(&record)?;
-    let store_with = |faults: Faults| {
-        DocumentBoxStore::new(Faulty::new(Arc::clone(&seeded), faults)).expect("open")
-    };
+    test_store(Arc::clone(&seeded))?.insert(&record)?;
+    let store_with =
+        |faults: Faults| test_store(Faulty::new(Arc::clone(&seeded), faults)).expect("open");
 
     let reading = store_with(Faults {
         get: true,
@@ -213,8 +235,12 @@ fn backend_failures_surface_as_store_errors_per_operation() -> Result<()> {
             ..
         })
     ));
+    let reading_update = store_with(Faults {
+        get: true,
+        ..Faults::default()
+    });
     assert!(matches!(
-        reading.set_state(&record.id, BoxState::Stopped),
+        reading_update.set_state(&record.id, BoxState::Stopped),
         Err(Error::Store {
             operation: "update",
             ..
@@ -244,8 +270,12 @@ fn backend_failures_surface_as_store_errors_per_operation() -> Result<()> {
             ..
         })
     ));
+    let writing_update = store_with(Faults {
+        put: true,
+        ..Faults::default()
+    });
     assert!(matches!(
-        writing.set_state(&record.id, BoxState::Stopped),
+        writing_update.set_state(&record.id, BoxState::Stopped),
         Err(Error::Store {
             operation: "update",
             ..
@@ -270,8 +300,8 @@ fn backend_failures_surface_as_store_errors_per_operation() -> Result<()> {
 fn set_state_retries_after_a_lost_race() -> Result<()> {
     let seeded = documents();
     let record = info("a")?;
-    DocumentBoxStore::new(Arc::clone(&seeded))?.insert(&record)?;
-    let store = DocumentBoxStore::new(Faulty::with_conflicts(Arc::clone(&seeded), 2))?;
+    test_store(Arc::clone(&seeded))?.insert(&record)?;
+    let store = test_store(Faulty::with_conflicts(Arc::clone(&seeded), 2))?;
     store.set_state(&record.id, BoxState::Stopped)?;
     assert_eq!(store.get(&record.id)?.state, BoxState::Stopped);
     Ok(())
@@ -281,8 +311,8 @@ fn set_state_retries_after_a_lost_race() -> Result<()> {
 fn set_state_gives_up_when_the_record_never_settles() -> Result<()> {
     let seeded = documents();
     let record = info("a")?;
-    DocumentBoxStore::new(Arc::clone(&seeded))?.insert(&record)?;
-    let store = DocumentBoxStore::new(Faulty::with_conflicts(seeded, usize::MAX))?;
+    test_store(Arc::clone(&seeded))?.insert(&record)?;
+    let store = test_store(Faulty::with_conflicts(seeded, usize::MAX))?;
     assert!(matches!(
         store.set_state(&record.id, BoxState::Stopped),
         Err(Error::Store {
@@ -295,7 +325,7 @@ fn set_state_gives_up_when_the_record_never_settles() -> Result<()> {
 
 #[test]
 fn the_debug_form_does_not_dump_the_backend() -> Result<()> {
-    let store = DocumentBoxStore::new(documents())?;
+    let store = test_store(documents())?;
     assert!(format!("{store:?}").starts_with("DocumentBoxStore"));
     Ok(())
 }
@@ -303,7 +333,7 @@ fn the_debug_form_does_not_dump_the_backend() -> Result<()> {
 #[test]
 fn a_stored_box_has_the_v2_body_and_schema_version() -> Result<()> {
     let docs = documents();
-    let store = DocumentBoxStore::new(Arc::clone(&docs))?;
+    let store = test_store(Arc::clone(&docs))?;
     store.insert(&info("build-1")?)?;
     let bridge = Blocking::new().expect("bridge");
     let reader = Arc::clone(&docs);
@@ -322,7 +352,7 @@ fn a_stored_box_has_the_v2_body_and_schema_version() -> Result<()> {
 #[test]
 fn a_box_missing_from_a_set_state_is_left_missing() -> Result<()> {
     let docs = documents();
-    let store = DocumentBoxStore::new(Arc::clone(&docs))?;
+    let store = test_store(Arc::clone(&docs))?;
     let id = BoxId::new("ghost")?;
     assert!(matches!(
         store.set_state(&id, BoxState::Stopped),
@@ -334,7 +364,7 @@ fn a_box_missing_from_a_set_state_is_left_missing() -> Result<()> {
 
 #[test]
 fn more_boxes_than_one_page_all_list() -> Result<()> {
-    let store = DocumentBoxStore::new(documents())?;
+    let store = test_store(documents())?;
     for n in 0..120 {
         store.insert(&info(&format!("b{n:03}"))?)?;
     }

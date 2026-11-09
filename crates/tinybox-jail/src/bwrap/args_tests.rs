@@ -240,10 +240,7 @@ fn deny_read_of_a_missing_path_is_refused() -> io::Result<()> {
     let root = tempfile::tempdir()?;
     let mut j = jail(root.path());
     j.deny_read = vec![root.path().join("later")];
-    assert_eq!(
-        jail_args(&j, None, OPTS).err().map(|error| error.kind()),
-        Some(io::ErrorKind::NotFound)
-    );
+    assert_eq!(build(&j).unwrap_err().kind(), io::ErrorKind::NotFound);
     Ok(())
 }
 
@@ -254,10 +251,7 @@ fn missing_denial_inside_a_read_only_grant_is_refused() -> io::Result<()> {
     let denied = grant.path().join("later");
     let mut j = jail(root.path()).add_read_only(grant.path());
     j.deny_read = vec![denied.clone()];
-    assert_eq!(
-        jail_args(&j, None, OPTS).err().map(|error| error.kind()),
-        Some(io::ErrorKind::NotFound)
-    );
+    assert_eq!(build(&j).unwrap_err().kind(), io::ErrorKind::NotFound);
     Ok(())
 }
 

@@ -147,9 +147,9 @@ fn failed_with(result: Result<impl std::fmt::Debug>, name: &str) -> bool {
     matches!(result, Err(Error::MethodFailed { name: found, .. }) if found == name)
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bytes_round_trip_through_stdin_and_stdout_until_eof() -> Result<()> {
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let resource = local_resource(&resources).await?;
     let backend = Recording::new();
     let process = start(&resources, &resource, &backend, &["cat"]).await?;
@@ -190,9 +190,9 @@ async fn bytes_round_trip_through_stdin_and_stdout_until_eof() -> Result<()> {
     resources.close(&resource).await
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stderr_stays_separate_and_exit_code_is_reported() -> Result<()> {
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let resource = local_resource(&resources).await?;
     let backend = Recording::new();
     let process = start(
@@ -212,9 +212,9 @@ async fn stderr_stays_separate_and_exit_code_is_reported() -> Result<()> {
     resources.close(&resource).await
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_full_buffer_backpressures_the_child_without_losing_bytes() -> Result<()> {
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let resource = local_resource(&resources).await?;
     let backend = Recording::new();
     let total = tinybox_bus::MAX_STDIO_BUFFER_BYTES * 2 + 12_345;
@@ -227,10 +227,10 @@ async fn a_full_buffer_backpressures_the_child_without_losing_bytes() -> Result<
     resources.close(&resource).await
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn request_environment_applies_but_module_environment_does_not_leak() -> Result<()> {
     assert!(std::env::var_os("CARGO_MANIFEST_DIR").is_some());
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let resource = local_resource(&resources).await?;
     let backend = Recording::new();
     let mut request = start_request(
@@ -246,9 +246,9 @@ async fn request_environment_applies_but_module_environment_does_not_leak() -> R
     resources.close(&resource).await
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kill_ends_the_whole_process_group_and_releases_the_handle() -> Result<()> {
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let resource = local_resource(&resources).await?;
     let backend = Recording::new();
     let process = start(
@@ -286,9 +286,9 @@ fn alive(pid: &str) -> bool {
         .is_ok_and(|status| status.success())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn closing_the_resource_kills_its_stdio_processes() -> Result<()> {
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let resource = local_resource(&resources).await?;
     let backend = Recording::new();
     let process = start(&resources, &resource, &backend, &["sleep", "60"]).await?;
@@ -301,9 +301,9 @@ async fn closing_the_resource_kills_its_stdio_processes() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unsuitable_unavailable_and_noop_backends_refuse_before_admission() -> Result<()> {
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let resource = local_resource(&resources).await?;
     let request = start_request(&resources, &resource, &["cat"]).await?;
     let unsuitable = Arc::new(Recording {
@@ -347,9 +347,9 @@ async fn unsuitable_unavailable_and_noop_backends_refuse_before_admission() -> R
     resources.close(&resource).await
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_jail_floor_and_credential_denials_reach_the_backend() -> Result<()> {
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let resource = local_resource(&resources).await?;
     let backend = Recording::new();
     let secrets = tempfile::tempdir()?;
@@ -371,9 +371,9 @@ async fn the_jail_floor_and_credential_denials_reach_the_backend() -> Result<()>
     resources.close(&resource).await
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn invalid_requests_replays_and_foreign_handles_are_rejected() -> Result<()> {
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let resource = local_resource(&resources).await?;
     let other = local_resource(&resources).await?;
     let backend = Recording::new();
@@ -440,9 +440,9 @@ async fn invalid_requests_replays_and_foreign_handles_are_rejected() -> Result<(
     resources.close(&other).await
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_stdio_processes_are_bounded() -> Result<()> {
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let resource = local_resource(&resources).await?;
     let backend = Recording::new();
     let mut live = Vec::new();
@@ -460,9 +460,9 @@ async fn live_stdio_processes_are_bounded() -> Result<()> {
     resources.close(&resource).await
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unknown_process_answers_unknown_and_kill_is_harmless() -> Result<()> {
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let resource = local_resource(&resources).await?;
     let ghost = ProcessRef {
         resource: resource.clone(),
@@ -501,9 +501,9 @@ async fn an_unknown_process_answers_unknown_and_kill_is_harmless() -> Result<()>
     resources.close(&resource).await
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_program_that_cannot_start_fails_and_frees_its_slot() -> Result<()> {
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let resource = local_resource(&resources).await?;
     let backend = Recording::new();
     let request = start_request(&resources, &resource, &["/nonexistent/tinybox-program"]).await?;
@@ -523,9 +523,9 @@ async fn a_program_that_cannot_start_fails_and_frees_its_slot() -> Result<()> {
     resources.close(&resource).await
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reads_are_capped_and_an_idle_read_returns_empty_after_its_wait() -> Result<()> {
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let resource = local_resource(&resources).await?;
     let backend = Recording::new();
     let process = start(&resources, &resource, &backend, &["cat"]).await?;
@@ -553,9 +553,9 @@ async fn reads_are_capped_and_an_idle_read_returns_empty_after_its_wait() -> Res
     resources.close(&resource).await
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dropping_the_registry_kills_a_stdio_child_it_still_owns() -> Result<()> {
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let resource = local_resource(&resources).await?;
     let backend = Recording::new();
     let process = start(
@@ -578,9 +578,9 @@ async fn dropping_the_registry_kills_a_stdio_child_it_still_owns() -> Result<()>
     .map_err(|_| Error::failed("child survived the registry"))
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_start_still_in_progress_blocks_lookups_and_duplicate_starts() -> Result<()> {
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let resource = local_resource(&resources).await?;
     let backend = Recording::new();
     let request = start_request(&resources, &resource, &["cat"]).await?;
@@ -605,9 +605,9 @@ async fn a_start_still_in_progress_blocks_lookups_and_duplicate_starts() -> Resu
     resources.close(&resource).await
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn close_waits_for_a_start_in_flight_before_it_finishes() -> Result<()> {
-    let resources = Arc::new(Resources::default());
+    let resources = Arc::new(Resources::test_resources());
     let resource = local_resource(&resources).await?;
     let target = ProcessRef {
         resource: resource.clone(),
@@ -633,9 +633,9 @@ async fn close_waits_for_a_start_in_flight_before_it_finishes() -> Result<()> {
     resources.close(&resource).await
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failed_stdio_cleanup_keeps_the_resource_registered_for_a_retry() -> Result<()> {
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let resource = local_resource(&resources).await?;
     let target = ProcessRef {
         resource: resource.clone(),
@@ -660,9 +660,9 @@ async fn a_failed_stdio_cleanup_keeps_the_resource_registered_for_a_retry() -> R
     resources.close(&resource).await
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stdio_children_count_against_the_per_resource_process_limit() -> Result<()> {
-    let resources = Resources::default();
+    let resources = Resources::test_resources();
     let resource = local_resource(&resources).await?;
     let backend = Recording::new();
     let mut live = Vec::new();

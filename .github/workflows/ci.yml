@@ -9,9 +9,63 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 jobs:
+  windows-unsafe-boundary:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Test the Windows FFI allowance guard
+        run: scripts/ci/check-windows-unsafe-boundary_tests.sh
+      - name: Check the Windows FFI allowance boundary
+        run: scripts/ci/check-windows-unsafe-boundary.sh
   module-ci:
     uses: tinyhumansai/.github/.github/workflows/module-ci.yml@4adc1080fb495098e7af1aade82ed7e6e3c69bb7
     with:
       coverage-script: scripts/check-coverage.sh
       module-e2e-script: scripts/test-e2e.sh
       feature-test-script: scripts/test-features.sh
+      apt-packages: bubblewrap
+  native-resource-live:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249
+      - name: Install rootless native jail prerequisites
+        run: |
+          source scripts/ci/prepare-rootless-native-resources.sh
+      - name: Run required Linux native resource proofs
+        shell: bash
+        run: |
+          set -euo pipefail
+          uid="$(id -u)"
+          runtime_dir="/run/user/${uid}"
+          export XDG_RUNTIME_DIR="$runtime_dir"
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime_dir/bus"
+          TINYBOX_REQUIRE_NATIVE_RESOURCE_TESTS=1 cargo test -j1 -p tinybox-module native_
+          TINYBOX_REQUIRE_NATIVE_RESOURCE_TESTS=1 cargo test -j1 -p tinybox-module resource_aware_bus_exec_cancellation_reports_events_and_reaps_descendants
+  docker-network-live:
+    name: Docker Egress and denied network connectivity
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249
+      - name: Require Docker daemon and default bridge gateway
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker info --format 'Docker daemon ready: {{.ServerVersion}}'
+          gateway="$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}')"
+          test -n "$gateway"
+          echo "Docker bridge gateway: $gateway"
+      - name: Prove Egress connectivity and default-Denied refusal
+        env:
+          TINYBOX_LIVE_DOCKER: "1"
+          TINYBOX_REQUIRE_LIVE_DOCKER: "1"
+        run: >-
+          cargo test --locked -p tinybox-docker --test live_docker
+          live_network_policy_controls_host_listener_connectivity --
+          --nocapture --test-threads=1

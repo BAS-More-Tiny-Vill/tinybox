@@ -98,6 +98,15 @@ that document would change its shape and stop an older store from loading,
 orphaning every box in it; a second file needs no migration and cannot break
 the first.
 
+The `tinybox` command composes the box and template stores over its selected
+TinyStorageDrivers backend. When it finds the legacy `boxes.json` or
+`templates.json` files, it imports validated records and leaves those files in
+place. Run only one CLI generation against a state directory during migration:
+the importer checks that each source still matches the bytes it read before it
+records completion, but that check does not lock out a concurrently running
+legacy writer. A changed source fails closed on the next open rather than being
+silently overwritten or deleted.
+
 ## Time and expiry
 
 Expiry needs to know when a box was created, so time enters the model through a
@@ -160,6 +169,7 @@ crates/
 ├── tinybox-sync/     # fingerprinting and transfer     (M4)
 ├── tinybox-docker/   # DockerSandbox                    (M3)
 ├── tinybox-linux/    # NamespaceSandbox                (M6)
+├── tinybox-openshell/ # OpenShellSandbox, over the `openshell` CLI
 ├── tinybox-cli/      # bin `tinybox`                    (M2)
 └── tinybox-module/   # cdylib, TinyBus ABI v1                    (M1)
 ```
@@ -202,7 +212,7 @@ composition in M4. ADR 0004 records the tradeoff.
 | `Snapshot` | The committed image. |
 | `GitRepo` | Refused by name — no clone step exists yet. |
 | Limits | `--memory`, `--cpus`, `--pids-limit`. Disk is **not** applied: `--storage-opt size=` works on a minority of storage drivers, and a flag that silently does nothing on most systems is worse than an honest omission. |
-| Network | `Denied` → `--network none`. Docker has no outbound-only mode, so `Egress` uses the default bridge; nothing is published inbound because tinybox never passes `--publish`. |
+| Network | `Denied` → `--network none`. Docker has no outbound-only mode, so `Egress` uses the default bridge. `Allowlist` requires an explicitly installed `NativeLinuxDockerEgressController` on a verified local rootful Linux Engine; it installs default-drop IPv4/IPv6 rules before the workload starts and allows only pinned IP/port pairs. Approved names map to pinned addresses in `/etc/hosts`; the only DNS upstream is container-local `127.0.0.1`, so unlisted names cannot fall back to host DNS. IPv6 neighbor solicitation and established published-port replies are the only exceptions to bridge-to-host drop rules. Desktop, remote, rootless, Windows, and unverified daemon configurations refuse it. |
 | State | Read from `docker inspect`, not from the store. A container can be stopped or removed by anything with daemon access, and reporting a stale `ready` would send commands to a box that is gone. Docker's `running` maps to `Ready`, because a tinybox box is `Running` only while a command executes and the keepalive loop is not a command. |
 
 `Sandbox::exec_observed` runs `docker exec -i` through the same `Host`, so
@@ -239,7 +249,9 @@ Box identifiers are unique within a `Store`; Docker container names are unique
 across a whole daemon. Those are different scopes, so two stores that both
 allocate `box-0` would fight over one container name. Containers are therefore
 named `tinybox-<namespace>-<box id>`, with the namespace defaulting to
-`default` and settable per sandbox.
+`default` and settable per sandbox. `OpenShell` gateways cap a sandbox name at 19
+characters, so that backend uses `tb-` and a digest of the same two parts, and
+keeps them readable in the sandbox's labels.
 
 This was found by the live suite rather than by review, and it is a real
 multi-user constraint, not a test artifact.

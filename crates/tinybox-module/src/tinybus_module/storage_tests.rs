@@ -1,40 +1,36 @@
-//! Tests for [`ModuleStorage`]: host-backed box records, jail index documents,
-//! the in-memory fallback, and connect retry.
+//! Tests for [`ModuleStorage`]: host-backed records and fail-closed absence.
 
 use super::*;
 use tinybox_core::WorkspaceSource;
-use tinybox_core::{BoxId, BoxInfo, BoxSpec, BoxState, HostRef, Placement, SandboxRef};
+use tinybox_core::{
+    BoxId, BoxInfo, BoxSpec, BoxState, HostRef, MemoryStore, Placement, SandboxRef,
+};
 use tinybus::broker::Broker;
 use tinybus::transport::memory::MemoryBus;
-use tinystoragedrivers_busproxy::{PerCallerEndpoint, ServedStorage, serve};
-use tinystoragedrivers_client::StorageServer;
-use tinystoragedrivers_core::{
-    DocumentStoreExt, MemoryStorage, Query, Scope, ScopedStorage, StorageBackend,
-};
+use tinystoragedrivers_api::{DocumentStoreExt, StorageBackend};
+use tinystoragedrivers_busproxy::{PerCallerEndpoint, ServedStorage, StorageServer, serve};
+use tinystoragedrivers_testkit::MemoryBackend;
+use tinystoragedrivers_types::{Query, Scope};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 /// A broker with a module-side connection and, optionally, a storage host.
 struct Rig {
     module: Connection,
-    backend: MemoryStorage,
+    backend: Arc<MemoryBackend>,
     _served: Option<ServedStorage>,
 }
 
 async fn rig(serve_storage: bool) -> Result<Rig, Box<dyn std::error::Error>> {
     let bus = MemoryBus::new();
     Broker::new().spawn(bus.clone());
-    let backend = MemoryStorage::new();
-    // The host declares what the module may store from the module's own schema.
-    tinystoragedrivers_core::schema::Registry::compose([tinybox_drivers::storage_schema()])?
-        .prepare(&backend)
-        .await?;
+    let backend = Arc::new(MemoryBackend::new());
     let host = Connection::connect(bus.connect().await?).await?;
     let served = if serve_storage {
-        let bound = backend.clone();
+        let bound = Arc::clone(&backend);
         let endpoint = PerCallerEndpoint::new(move |_sender| {
-            let scoped: ScopedStorage = bound.for_scope(&Scope::local()).ok()?;
-            Some(StorageServer::new(scoped))
+            let storage = bound.for_scope(&Scope::new("module/test").ok()?).ok()?;
+            Some(StorageServer::new(storage))
         });
         Some(serve(&host, Arc::new(endpoint)).await?)
     } else {
@@ -62,7 +58,11 @@ async fn host_docs(
     rig: &Rig,
     collection: &'static str,
 ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
-    let docs = Arc::clone(rig.backend.for_scope(&Scope::local())?.documents());
+    let docs = Arc::clone(
+        rig.backend
+            .for_scope(&Scope::new("module/test")?)?
+            .documents(),
+    );
     let all = docs.query_all(collection, &Query::all()).await?;
     Ok(all.into_iter().map(|entry| entry.doc).collect())
 }
@@ -105,17 +105,11 @@ async fn store_calls_on_the_only_worker_do_not_deadlock() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn without_a_storage_host_box_records_stay_in_memory() -> TestResult {
+async fn without_a_storage_host_box_records_fail_closed() -> TestResult {
     let rig = rig(false).await?;
     let storage = ModuleStorage::connected(rig.module.clone());
     assert!(storage.documents().await.is_none());
-    let store = storage.box_store().await?;
-    let record = info("memory-box")?;
-    let writer = Arc::clone(&store);
-    let written = record.clone();
-    tokio::task::spawn_blocking(move || writer.insert(&written)).await??;
-    let docs = host_docs(&rig, tinybox_drivers::BOX_COLLECTION).await?;
-    assert_eq!(docs.len(), 0);
+    assert!(storage.box_store().await.is_err());
     Ok(())
 }
 
@@ -162,9 +156,11 @@ async fn a_failed_connect_is_retried_when_the_host_starts_serving() -> TestResul
     let storage = ModuleStorage::connected(module);
     assert!(storage.documents().await.is_none());
 
-    let backend = MemoryStorage::new();
+    let backend = MemoryBackend::new();
     let endpoint = PerCallerEndpoint::new(move |_sender| {
-        Some(StorageServer::new(backend.for_scope(&Scope::local()).ok()?))
+        Some(StorageServer::new(
+            backend.for_scope(&Scope::new("module/test").ok()?).ok()?,
+        ))
     });
     let _served = serve(&host, Arc::new(endpoint)).await?;
     assert!(storage.documents().await.is_some());
@@ -212,7 +208,7 @@ async fn the_scoped_handle_is_connected_once_and_shared() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_refused_scope_leaves_the_module_on_memory() -> TestResult {
+async fn an_unserved_host_does_not_provision_volatile_box_storage() -> TestResult {
     let bus = MemoryBus::new();
     Broker::new().spawn(bus.clone());
     let host = Connection::connect(bus.connect().await?).await?;
@@ -221,7 +217,7 @@ async fn a_refused_scope_leaves_the_module_on_memory() -> TestResult {
     let _served = serve(&host, Arc::new(endpoint)).await?;
     let storage = ModuleStorage::connected(module);
     assert!(storage.documents().await.is_none());
-    let _memory = storage.box_store().await?;
+    assert!(storage.box_store().await.is_err());
     Ok(())
 }
 
@@ -257,5 +253,19 @@ async fn a_recording_view_finds_only_its_own_record() -> TestResult {
     first.remove(&BoxId::new("box-0")?)?;
     second.insert(&info("box-0")?)?;
     assert!(first.first_inserted().is_none());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bus_backed_store_leaves_the_schema_and_migrations_to_the_host() -> TestResult {
+    let rig = rig(true).await?;
+    let storage = ModuleStorage::connected(rig.module.clone());
+    storage.box_store().await?;
+
+    let receipts = host_docs(&rig, tinybox_drivers::MIGRATIONS_COLLECTION).await?;
+    assert!(
+        receipts.is_empty(),
+        "the module ran its own migrations on the host's ports: {receipts:?}"
+    );
     Ok(())
 }

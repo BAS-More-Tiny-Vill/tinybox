@@ -3,11 +3,13 @@
 use std::sync::Arc;
 
 use tinybox_core::{BoxId, BoxInfo, BoxState, Error, Result, Store};
-use tinystoragedrivers_core::{
-    Blocking, DocumentStore, ErrorKind, Key, Query, Repo, StorageError, WriteOptions,
-};
+use tinystoragedrivers_api::{DocumentStore, Storage};
+use tinystoragedrivers_types::{ErrorKind, Key, Query, StorageError, WriteOptions};
 
+use crate::blocking::Blocking;
+use crate::migrations;
 use crate::record::{BoxRecord, StateRecord};
+use crate::repo::Repo;
 use tinybox_bus::storage::{BODY_VERSION, BOX_COLLECTION};
 
 /// Box records as documents, `box.boxes/<box id>`.
@@ -15,10 +17,10 @@ use tinybox_bus::storage::{BODY_VERSION, BOX_COLLECTION};
 /// Inserts use an absent-only precondition, so two processes racing for one
 /// name resolve to a [`Error::DuplicateBox`] for the loser (which
 /// [`insert_new`](tinybox_core::store::insert_new) retries). State changes are
-/// one compare-and-swap loop on the document version ([`Repo::update`]), so
+/// one compare-and-swap loop on the document version, so
 /// they never overwrite a concurrent change.
 ///
-/// The collection is declared by the host, from [`storage_schema`](crate::storage_schema).
+/// The collection is declared and migrated by the owner when this store opens.
 #[derive(Clone)]
 pub struct DocumentBoxStore {
     boxes: Repo<BoxRecord>,
@@ -32,16 +34,39 @@ impl std::fmt::Debug for DocumentBoxStore {
 }
 
 impl DocumentBoxStore {
-    /// A store on `documents`.
+    /// Open a store and migrate legacy box documents before returning it.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Store`] when the bridge cannot start.
-    #[allow(
-        clippy::needless_pass_by_value,
-        reason = "the handle is taken by value, as it always was"
-    )]
-    pub fn new(documents: Arc<dyn DocumentStore>) -> Result<Self> {
+    /// Returns [`Error::Store`] when declarations, migrations, or the bridge
+    /// cannot be opened.
+    pub async fn open(storage: Storage) -> Result<Self> {
+        migrations::prepare(&storage)
+            .await
+            .map_err(|error| store_error("open", &error))?;
+        Self::on_prepared(&storage)
+    }
+
+    /// Open a store on ports a host manages, reached over the storage bus.
+    ///
+    /// The host owns the schema and the data migration there: it declared the
+    /// collections when it bound the module's scope, and its grant does not
+    /// reach the v1 source collections, so this only confirms the current
+    /// declarations and migrates nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Store`] when the host refuses a declaration or the
+    /// bridge cannot be opened.
+    pub async fn open_host_managed(storage: Storage) -> Result<Self> {
+        migrations::declare(&storage)
+            .await
+            .map_err(|error| store_error("open", &error))?;
+        Self::on_prepared(&storage)
+    }
+
+    fn on_prepared(storage: &Storage) -> Result<Self> {
+        let documents: Arc<dyn DocumentStore> = Arc::clone(storage.documents());
         let bridge = Blocking::new().map_err(|error| store_error("open", &error))?;
         let boxes = Repo::new(&documents, BOX_COLLECTION)
             .map_err(|error| store_error("open", &error))?
@@ -70,7 +95,7 @@ fn store_error(operation: &'static str, error: &StorageError) -> Error {
 }
 
 fn key(id: &BoxId) -> Result<String> {
-    Key::of([id.as_str()])
+    Key::new(id.as_str())
         .map(|key| key.as_str().to_owned())
         .map_err(|error| store_error("key", &error))
 }

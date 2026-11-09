@@ -38,12 +38,17 @@ tinybox-core.workspace = true
 tinybox-docker.workspace = true
 tinybox-linux.workspace = true
 tinybox-microvm.workspace = true
+# OpenShell sandboxes are driven through the same host the module already owns.
+tinybox-openshell.workspace = true
+# agent37 sandboxes run on a hosted HTTP service, with no owned host.
+tinybox-agent37.workspace = true
 tinybus.workspace = true
 tinybus-module.workspace = true
 # Box records live on the host's storage ports, reached over the storage bus;
 # the module has no storage backend or file of its own.
 tinybox-drivers.workspace = true
-tinystoragedrivers-core.workspace = true
+tinystoragedrivers-api.workspace = true
+tinystoragedrivers-types.workspace = true
 tinystoragedrivers-busproxy.workspace = true
 log = "0.4"
 
@@ -52,11 +57,11 @@ tempfile = "3"
 
 [target.'cfg(unix)'.dependencies]
 # Stdio children own a process group that is killed as a unit.
-nix = { version = "0.31", default-features = false, features = ["signal", "process"] }
+nix = { version = "0.31", default-features = false, features = ["signal", "process", "fs"] }
 
 [dev-dependencies]
 # Tests serve the storage objects on the in-memory broker the module connects to.
-tinystoragedrivers-client.workspace = true
+tinystoragedrivers-testkit.workspace = true
 # Deterministic delayed-host fixtures implement the existing object-safe host trait.
 async-trait.workspace = true
 # Module integration tests exercise the real asynchronous in-memory TinyBus.

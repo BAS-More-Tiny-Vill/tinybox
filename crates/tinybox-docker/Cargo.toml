@@ -15,7 +15,13 @@ publish = false
 [dependencies]
 tinybox-core.workspace = true
 async-trait.workspace = true
+# Parse Docker-assigned CIDRs and reject pinned destinations within them.
+ipnet = "2.12"
 serde_json.workspace = true
+# Keep workload Docker client credentials out of host CLI environment and argv.
+tempfile = "3"
+# SHA-256 keeps firewall cleanup ownership markers collision-resistant.
+sha2 = "0.11.1"
 # `DockerCli` runs the local `docker` client; one-shot runs need process spawning
 # and a deadline.
 tokio = { workspace = true, features = ["process", "io-util"] }
@@ -25,7 +31,6 @@ uuid = { version = "1", features = ["v4"] }
 tokio.workspace = true
 # The live suite drives a real daemon through the real local host.
 tinybox-host.workspace = true
-tempfile = "3"
 
 [lints]
 workspace = true

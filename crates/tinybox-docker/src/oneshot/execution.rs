@@ -23,6 +23,7 @@ pub(super) async fn run(
     let started = Instant::now();
     let mut child = Command::new(&cli.program)
         .args(args)
+        .envs(spec.env.iter().map(|(key, value)| (key, value)))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)

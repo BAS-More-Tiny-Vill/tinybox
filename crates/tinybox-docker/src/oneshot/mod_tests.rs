@@ -100,6 +100,7 @@ fn defaults_produce_the_pinned_command_line() {
     expected.extend(s(&[
         "-w",
         "/workspace",
+        "--",
         "alpine:3.20",
         "sh",
         "-c",
@@ -137,7 +138,8 @@ fn without_workspace_preserves_isolation_flags_without_mount_or_workdir() {
     assert!(has_pair(&argv, "--network", "bridge"));
     assert!(has_pair(&argv, "-m", "2048m"));
     assert!(has_pair(&argv, "--cpus", "2.5"));
-    assert!(has_pair(&argv, "-e", "MODE=host-cwd"));
+    assert!(has_pair(&argv, "-e", "MODE"));
+    assert!(!argv.iter().any(|arg| arg.contains("host-cwd")));
     assert!(!argv.iter().any(|arg| arg == "-v"));
     assert!(!argv.iter().any(|arg| arg == "-w"));
     assert!(!argv.iter().any(|arg| arg == "--read-only"));
@@ -197,9 +199,10 @@ fn overrides_mounts_and_env_are_ordered() {
         "-v",
         "/definitely/not/here:/definitely/not/here:ro",
         "-e",
-        "A=1",
+        "A",
         "-e",
-        "REQ_KEY=req value=1",
+        "REQ_KEY",
+        "--",
         "debian:12",
         "sh",
         "-c",
@@ -370,4 +373,99 @@ async fn legacy_label_cleanup_keeps_its_best_effort_result() {
         "if [ \"$1\" = ps ]; then echo container-id; exit 0; fi; exit 1",
     );
     assert_eq!(cli.kill_labelled("l=1").await.unwrap(), 1);
+}
+
+#[test]
+fn an_image_that_looks_like_a_flag_stays_a_positional() {
+    let tmp = tempfile::tempdir().unwrap();
+    let argv = strings(
+        &OneShot::new(tmp.path(), "true")
+            .with_image("--privileged")
+            .argv(),
+    );
+    let image = argv.iter().position(|arg| arg == "--privileged").unwrap();
+    assert_eq!(argv[image - 1], "--", "{argv:?}");
+}
+
+#[tokio::test]
+async fn audit_h6_a_timed_out_run_kills_its_client_and_its_container() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (pid, name, calls) = (
+        tmp.path().join("pid"),
+        tmp.path().join("name"),
+        tmp.path().join("calls"),
+    );
+    let (cli, _) = fake(
+        tmp.path(),
+        &format!(
+            "case \"$1\" in\n\
+             run) echo $$ > '{pid}'; echo \"$4\" > '{name}'; exec sleep 30;;\n\
+             kill) echo \"$*\" >> '{calls}';;\n\
+             esac",
+            pid = pid.display(),
+            name = name.display(),
+            calls = calls.display(),
+        ),
+    );
+    let got = cli
+        .run_one_shot(&OneShot::new(tmp.path(), "x"), Duration::from_millis(300))
+        .await
+        .unwrap();
+    assert!(got.timed_out);
+    assert_eq!(got.killed, Some(true));
+
+    // The fork addresses only this invocation, by its unique container name.
+    let name = std::fs::read_to_string(&name).unwrap();
+    assert!(name.starts_with("tinybox-"), "{name}");
+    assert_eq!(
+        std::fs::read_to_string(&calls).unwrap_or_default(),
+        format!("kill {name}"),
+        "the container must be killed by this run's own name"
+    );
+
+    let pid = std::fs::read_to_string(&pid).unwrap().trim().to_owned();
+    // Alive = listed and not a zombie (an unreaped killed child still answers `kill -0`).
+    let alive = || {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid])
+            .output()
+            .unwrap();
+        let stat = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        !stat.is_empty() && !stat.starts_with('Z')
+    };
+    for _ in 0..20 {
+        if !alive() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let still_alive = alive();
+    if still_alive {
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &pid])
+            .status();
+    }
+    assert!(
+        !still_alive,
+        "docker client pid {pid} still alive 1s after the timeout reported it killed"
+    );
+}
+
+#[tokio::test]
+async fn audit_m1_env_values_reach_the_client_but_never_its_argv() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (cli, out) = fake(tmp.path(), "printf '%s' \"$API_TOKEN\"");
+    let spec = OneShot::new(tmp.path(), "true")
+        .without_workspace()
+        .with_env([(OsString::from("API_TOKEN"), OsString::from("s3cret"))]);
+
+    let outcome = cli
+        .run_one_shot(&spec, Duration::from_secs(5))
+        .await
+        .unwrap();
+
+    let argv = recorded(&out);
+    assert!(has_pair(&argv, "-e", "API_TOKEN"), "{argv:?}");
+    assert!(!argv.iter().any(|arg| arg.contains("s3cret")), "{argv:?}");
+    assert_eq!(outcome.stdout, "s3cret");
 }

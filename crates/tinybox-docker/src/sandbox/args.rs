@@ -11,6 +11,8 @@ use tinybox_core::{
     WorkspaceSource,
 };
 
+use crate::PreparedEgressNetwork;
+
 use super::NAME;
 
 /// The label every tinybox container carries, so a stray container can be
@@ -102,6 +104,7 @@ pub(super) fn run(
     id: &BoxId,
     attempt: &str,
     spec: &BoxSpec,
+    allowlist_network: Option<&PreparedEgressNetwork>,
 ) -> Result<Vec<String>> {
     let mut argv = vec![
         "docker".to_owned(),
@@ -113,10 +116,28 @@ pub(super) fn run(
         format!("{OWNER_LABEL}={id}"),
         "--label".to_owned(),
         format!("{OWNER_ATTEMPT_LABEL}={attempt}"),
+        // Stop setuid/setgid escalation inside the container.
+        "--security-opt".to_owned(),
+        "no-new-privileges".to_owned(),
     ];
 
     argv.extend(resource_flags(&spec.resources));
-    argv.extend(network_flags(&spec.network));
+    if let Some(network) = allowlist_network {
+        argv.extend(["--network".to_owned(), network.network().to_owned()]);
+        // Custom Docker bridges use an embedded resolver that can forward DNS
+        // outside our per-bridge firewall. Pin its sole upstream to the
+        // workload's own loopback; approved names arrive through --add-host.
+        argv.extend(["--dns".to_owned(), "127.0.0.1".to_owned()]);
+        for (hostname, address) in network.host_mappings() {
+            let address = match address {
+                std::net::IpAddr::V4(address) => address.to_string(),
+                std::net::IpAddr::V6(address) => format!("[{address}]"),
+            };
+            argv.extend(["--add-host".to_owned(), format!("{hostname}:{address}")]);
+        }
+    } else {
+        argv.extend(network_flags(&spec.network));
+    }
     argv.extend(port_flags(spec));
 
     if let WorkspaceSource::LocalDir(path) = &spec.source {
@@ -126,11 +147,15 @@ pub(super) fn run(
         argv.push(WORKSPACE_MOUNT.to_owned());
     }
 
-    for (key, value) in &spec.env {
+    // Names only; the caller hands the values to the docker client's
+    // environment so they never appear on its argv.
+    for key in spec.env.keys() {
         argv.push("--env".to_owned());
-        argv.push(format!("{key}={value}"));
+        argv.push(key.clone());
     }
 
+    // End docker's options so an image like `--privileged` stays a positional.
+    argv.push("--".to_owned());
     argv.push(image_reference(spec)?);
     argv.extend(KEEPALIVE.iter().map(|part| (*part).to_owned()));
     Ok(argv)
@@ -224,9 +249,11 @@ pub(super) fn add_exec_context(argv: &mut Vec<String>, request: &ExecRequest) {
         argv.push("--workdir".to_owned());
         argv.push(cwd.display().to_string());
     }
-    for (key, value) in &request.env {
+    // Names only; the caller hands the values to the docker client's
+    // environment so they never appear on its argv.
+    for key in request.env.keys() {
         argv.push("--env".to_owned());
-        argv.push(format!("{key}={value}"));
+        argv.push(key.clone());
     }
 }
 

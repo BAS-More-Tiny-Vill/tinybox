@@ -201,6 +201,16 @@ pub enum Error {
         message: String,
     },
 
+    /// A Docker egress controller could not undo resources created for an
+    /// allowlist network, so the sandbox must retain the box record for retry.
+    #[error("{sandbox} could not roll back egress network setup: {message}")]
+    EgressRollbackFailed {
+        /// The sandbox whose egress resources could not be removed.
+        sandbox: String,
+        /// The setup and cleanup failures that require a later retry.
+        message: String,
+    },
+
     /// Reading or writing the box store failed, or its contents were not
     /// valid.
     #[error("box store {operation} failed: {message}")]

@@ -165,6 +165,15 @@ pub(super) fn cmdline(request: &ExecRequest, sandbox: &str) -> Result<String> {
         });
     }
 
+    // `script` writes each key unquoted after `export`, so a key must be a
+    // plain shell name or it would run as shell code in the guest.
+    if let Some(key) = request.env.keys().find(|key| !is_shell_name(key)) {
+        return Err(Error::InvalidIdentifier {
+            kind: "environment variable name",
+            value: key.clone(),
+        });
+    }
+
     let encoded = base64(script(request).as_bytes());
     // `console=ttyS0` is how output comes back at all; `reboot=k` is what makes
     // the guest's reset something the hypervisor observes; `pci=off` and
@@ -207,6 +216,15 @@ fn script(request: &ExecRequest) -> String {
     }
     script.push('\n');
     script
+}
+
+/// Whether `key` is a POSIX shell name: `[A-Za-z_][A-Za-z0-9_]*`.
+fn is_shell_name(key: &str) -> bool {
+    let mut chars = key.chars();
+    chars
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Quote one argument for the guest's shell.

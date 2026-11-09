@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tinybox_core::{Error, ExecOutput, ExecRequest, Forward, Host, Result};
+use tinybox_core::{Error, ExecOutput, ExecRequest, Forward, Host, HostExecutionLocation, Result};
 
 mod forward;
 mod observed;
@@ -185,6 +185,10 @@ impl SshHost {
 impl Host for SshHost {
     fn name(&self) -> &'static str {
         NAME
+    }
+
+    fn execution_location(&self) -> HostExecutionLocation {
+        HostExecutionLocation::Remote
     }
 
     /// Run a command on the far machine and collect its output.

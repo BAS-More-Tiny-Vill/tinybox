@@ -5,15 +5,9 @@
 //! top-level [`crate::spawn`] function — they
 //! never pick a backend by name.
 
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
-
-const RESOURCE_CONSTRAINTS: [tinybox_core::Constraint; 4] = [
-    tinybox_core::Constraint::Cpu,
-    tinybox_core::Constraint::Memory,
-    tinybox_core::Constraint::Pids,
-    tinybox_core::Constraint::Disk,
-];
 
 /// Declarative description of a directory jail.
 ///
@@ -40,11 +34,13 @@ pub struct Jail {
     /// native module rejects overlaps that an allow-list backend cannot enforce.
     /// Missing paths are retained so backend rules can cover later creation.
     pub deny_read: Vec<PathBuf>,
-    /// Optional hard CPU, memory, process and writable-disk limits.
+    /// Optional resource values to apply where the backend supports them.
     ///
-    /// Backends include the corresponding constraints in preflight. A backend
-    /// that does not enforce every requested limit refuses before spawning.
+    /// These values are defaults, not hard requirements. Use
+    /// [`hard_requirements`](Self::hard_requirements) to require enforcement.
     pub resources: Option<tinybox_core::Resources>,
+    /// Constraints the backend must enforce fully before spawning.
+    pub hard_requirements: Vec<tinybox_core::Constraint>,
     /// Allow outbound network. Most agent tools need this; some risky tools
     /// (untrusted code execution) should disable it.
     pub allow_net: bool,
@@ -66,6 +62,7 @@ impl Jail {
             read_write: Vec::new(),
             deny_read: Vec::new(),
             resources: None,
+            hard_requirements: Vec::new(),
             allow_net: true,
             allow_subprocess: true,
             label: label.into(),
@@ -105,6 +102,35 @@ impl Jail {
         self
     }
 
+    /// Require the backend to fully enforce each listed constraint.
+    #[must_use]
+    pub fn with_hard_requirements(
+        mut self,
+        requirements: impl IntoIterator<Item = tinybox_core::Constraint>,
+    ) -> Self {
+        self.hard_requirements = requirements.into_iter().collect();
+        self.deny_required()
+    }
+
+    /// Copy resource defaults and hard constraints from a box specification.
+    /// Filesystem roots and grants remain explicit Jail data; a hard network
+    /// or subprocess requirement denies that access.
+    #[must_use]
+    pub fn with_box_spec(mut self, spec: &tinybox_core::BoxSpec) -> Self {
+        self.resources = Some(spec.resources);
+        self.hard_requirements.clone_from(&spec.hard_requirements);
+        self.deny_required()
+    }
+
+    /// A hard `Network` or `Subprocess` requirement is a denial, so the flags
+    /// backends launch from agree with what preflight checked.
+    fn deny_required(mut self) -> Self {
+        use tinybox_core::Constraint;
+        self.allow_net &= !self.hard_requirements.contains(&Constraint::Network);
+        self.allow_subprocess &= !self.hard_requirements.contains(&Constraint::Subprocess);
+        self
+    }
+
     /// Hard constraints implied by this jail's grants and denial flags.
     #[must_use]
     pub fn constraints(&self) -> Vec<tinybox_core::Constraint> {
@@ -116,13 +142,10 @@ impl Jail {
         if !self.allow_subprocess {
             constraints.push(Constraint::Subprocess);
         }
-        if self.resources.is_some() {
-            constraints.extend([
-                Constraint::Cpu,
-                Constraint::Memory,
-                Constraint::Pids,
-                Constraint::Disk,
-            ]);
+        for constraint in &self.hard_requirements {
+            if !constraints.contains(constraint) {
+                constraints.push(*constraint);
+            }
         }
         constraints
     }
@@ -283,6 +306,27 @@ pub(crate) fn reject_symlink_below(ancestor: &Path, path: &Path) -> std::io::Res
     Ok(())
 }
 
+/// Refuses `deny` when it sits two or more levels inside `writable`: the child
+/// could rename the directory in between and read the denied path under its
+/// new name, which a path-based mask or profile rule no longer matches. A
+/// direct child of `writable` (or a path outside it) passes.
+#[must_use]
+pub fn nested_denial(deny: &Path, writable: &Path) -> Option<std::io::Error> {
+    if !deny.starts_with(writable) || deny.parent() == Some(writable) {
+        return None;
+    }
+    Some(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "deny_read {} is nested inside writable grant {}; the child could rename \
+             a parent directory and bypass the mask (deny a direct child of the grant, \
+             or make the grant read-only)",
+            deny.display(),
+            writable.display()
+        ),
+    ))
+}
+
 /// OS-specific enforcement of a [`Jail`].
 ///
 /// We model spawning rather than `Command` mutation because Windows
@@ -306,6 +350,15 @@ pub trait JailBackend: Send + Sync {
         false
     }
 
+    /// Refuses a [`Jail::deny_read`] entry this backend's carve cannot hold.
+    /// Callers run it before admitting a jail; the default refuses nothing.
+    ///
+    /// # Errors
+    /// `InvalidInput` naming the denial.
+    fn validate_carved_denials(&self, _jail: &Jail) -> std::io::Result<()> {
+        Ok(())
+    }
+
     /// Stable identifier, used in logs / audit ("landlock", "seatbelt",
     /// "appcontainer", "noop").
     fn name(&self) -> &'static str;
@@ -314,6 +367,12 @@ pub trait JailBackend: Send + Sync {
     /// on this kernel build. Auto-detection consults this before returning
     /// a backend.
     fn is_available(&self) -> bool;
+
+    /// Whether the backend can spawn through [`OwnedChild`]. Backends that
+    /// cannot expose a `std::process::Child` may override this independently.
+    fn is_owned_available(&self) -> bool {
+        self.is_available()
+    }
 
     /// Declares implemented constraints; unknown backends claim nothing.
     fn constraint_support(&self) -> tinybox_core::ConstraintSupport {
@@ -366,6 +425,21 @@ pub trait JailBackend: Send + Sync {
         self.constraint_support().plan_check(&jail.constraints())
     }
 
+    /// Inspect only the hard requirements explicitly listed on a box spec.
+    fn plan_check_spec(&self, spec: &tinybox_core::BoxSpec) -> tinybox_core::PlanCheck {
+        self.constraint_support()
+            .plan_check(&spec.hard_requirements)
+    }
+
+    /// Refuse a box spec when any explicit hard requirement is unsupported.
+    ///
+    /// # Errors
+    /// Returns a typed refusal naming the first unsupported hard constraint.
+    fn require_spec(&self, spec: &tinybox_core::BoxSpec) -> tinybox_core::Result<()> {
+        self.constraint_support()
+            .require(self.name(), &spec.hard_requirements)
+    }
+
     /// Refuse incomplete filesystem, network or subprocess confinement.
     ///
     /// # Errors
@@ -375,20 +449,16 @@ pub trait JailBackend: Send + Sync {
             .require(self.name(), &jail.constraints())
     }
 
-    /// Require full enforcement for every resource limit present on a jail.
-    ///
-    /// Resource limits are hard requirements even when the caller accepts
-    /// declared filesystem, network, or subprocess enforcement.
+    /// Validate resource values and preflight every explicit hard requirement.
     ///
     /// # Errors
-    /// Returns a typed refusal if any requested resource constraint is not
-    /// fully enforced.
+    /// Returns a typed refusal if any listed hard constraint is not fully enforced.
     fn require_resources(&self, jail: &Jail) -> tinybox_core::Result<()> {
         if let Some(resources) = jail.resources {
             resources.validate()?;
-            self.constraint_support()
-                .require(self.name(), &RESOURCE_CONSTRAINTS)?;
         }
+        self.constraint_support()
+            .require(self.name(), &jail.hard_requirements)?;
         Ok(())
     }
 
@@ -405,6 +475,7 @@ pub trait JailBackend: Send + Sync {
 
     /// Spawn with module-owned stdin, stdout, and stderr pipes.
     /// Wrapping providers must apply these pipes to their actual launcher.
+    /// On Unix, providers must also honor `Command` process-group settings.
     /// Callers must run [`JailBackend::require_resources`] first when
     /// `jail.resources` is present.
     /// # Errors
@@ -415,6 +486,311 @@ pub trait JailBackend: Send + Sync {
             .stderr(std::process::Stdio::piped());
         self.spawn(jail, cmd)
     }
+
+    /// Spawn captured work through the owned-child boundary.
+    ///
+    /// Backends that need a custom process owner may override this method to
+    /// provide pipe files and process supervision without exposing a
+    /// `std::process::Child`. The default adapter owns only the direct child;
+    /// override it when the backend must also own and stop descendants.
+    /// Implementations of [`OwnedProcess::terminate`] must return promptly;
+    /// callers bound asynchronous waiting, but cannot preempt a blocking
+    /// synchronous termination operation. Existing backends use the default
+    /// adapter. The default adapter requests a new local process group before
+    /// spawning and records the returned standard child's ID as that group;
+    /// custom owned adapters must set group metadata explicitly only when
+    /// they own a verified local process group.
+    /// # Errors
+    /// Returns the provider's confinement or native startup error.
+    fn spawn_owned_captured(&self, jail: &Jail, cmd: Command) -> std::io::Result<OwnedChild> {
+        #[cfg(unix)]
+        let cmd = {
+            use std::os::unix::process::CommandExt;
+            let mut cmd = cmd;
+            cmd.process_group(0);
+            cmd
+        };
+        let child = self.spawn_captured(jail, cmd)?;
+        #[cfg(unix)]
+        {
+            let group = child.id();
+            OwnedChild::from_std(child).map(|child| child.with_local_process_group_id(group))
+        }
+        #[cfg(not(unix))]
+        {
+            OwnedChild::from_std(child)
+        }
+    }
+
+    /// Spawn captured work with exactly the environment approved by the host.
+    /// The default clears `cmd`'s environment and applies `env` before
+    /// delegating; native launchers must build the child environment from
+    /// `env` instead of inheriting the parent's.
+    /// # Errors
+    /// Returns a confinement or native startup error.
+    fn spawn_owned_captured_with_env(
+        &self,
+        jail: &Jail,
+        mut cmd: Command,
+        env: &std::collections::BTreeMap<String, String>,
+    ) -> std::io::Result<OwnedChild> {
+        cmd.env_clear().envs(env);
+        self.spawn_owned_captured(jail, cmd)
+    }
+}
+
+/// Exit information independent of a platform-specific child handle.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChildStatus {
+    code: Option<i32>,
+}
+
+impl ChildStatus {
+    /// Construct status from the native process exit code. Signal termination
+    /// is represented by `None` on platforms that expose it that way.
+    #[must_use]
+    pub const fn from_code(code: Option<i32>) -> Self {
+        Self { code }
+    }
+
+    /// Exit code when the process has one (signal termination has none).
+    #[must_use]
+    pub const fn code(self) -> Option<i32> {
+        self.code
+    }
+
+    /// Whether the process returned exit code zero.
+    #[must_use]
+    pub const fn success(self) -> bool {
+        matches!(self.code, Some(0))
+    }
+}
+
+/// Process operations retained independently from its captured standard pipes.
+///
+/// Implementations must not report completion until the owned process has
+/// exited. `terminate` must return promptly and stop every process the
+/// backend owns for this run. A backend that owns only the direct child must
+/// document that boundary; callers may separately supervise a process group.
+pub trait OwnedProcess: Send {
+    /// Native identifier, when one is available.
+    fn id(&self) -> Option<u32>;
+    /// Nonblocking completion check.
+    /// # Errors
+    /// Returns an operating-system error while inspecting the process.
+    fn try_wait(&mut self) -> std::io::Result<Option<ChildStatus>>;
+    /// Stop the processes this backend owns, returning promptly.
+    ///
+    /// The standard-child adapter owns and stops only the direct child. A
+    /// backend may stop descendants when it has an explicit ownership
+    /// mechanism, such as a process group or job object. This synchronous
+    /// method must not perform unbounded blocking work because async callers
+    /// cannot preempt it with a timeout.
+    /// # Errors
+    /// Returns an operating-system error while terminating the process.
+    fn terminate(&mut self) -> std::io::Result<()>;
+}
+
+/// A captured process whose process owner and standard pipes can be supplied
+/// independently by a jail backend.
+pub struct OwnedChild {
+    process: Box<dyn OwnedProcess>,
+    local_process_group_id: Option<u32>,
+    stdin: Option<File>,
+    stdout: Option<File>,
+    stderr: Option<File>,
+}
+
+impl std::fmt::Debug for OwnedChild {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OwnedChild")
+            .field("id", &self.id())
+            .field("has_stdin", &self.stdin.is_some())
+            .field("has_stdout", &self.stdout.is_some())
+            .field("has_stderr", &self.stderr.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl OwnedChild {
+    /// Construct an owned child from a process adapter and its captured pipes.
+    #[must_use]
+    pub fn new(
+        process: impl OwnedProcess + 'static,
+        stdin: Option<File>,
+        stdout: Option<File>,
+        stderr: Option<File>,
+    ) -> Self {
+        Self {
+            process: Box::new(process),
+            local_process_group_id: None,
+            stdin,
+            stdout,
+            stderr,
+        }
+    }
+
+    /// Adapt a standard child and its configured pipes to the owned interface.
+    /// # Errors
+    /// Returns an error on platforms where standard child pipes cannot be
+    /// converted into owned files.
+    pub fn from_std(child: Child) -> std::io::Result<Self> {
+        let mut child = StdOwnedProcess(child);
+        let stdin = child.0.stdin.take().map(child_stdin_file).transpose()?;
+        let stdout = child.0.stdout.take().map(child_stdout_file).transpose()?;
+        let stderr = child.0.stderr.take().map(child_stderr_file).transpose()?;
+        Ok(Self::new(child, stdin, stdout, stderr))
+    }
+
+    /// Native child identifier, when available.
+    #[must_use]
+    pub fn id(&self) -> Option<u32> {
+        self.process.id()
+    }
+
+    /// Attach the verified ID of a local process group this backend owns.
+    ///
+    /// This is separate from [`OwnedProcess::id`], which may be a brokered or
+    /// otherwise nonlocal native ID. Call this only when the backend can prove
+    /// that the value names a local process group safe for the host to signal.
+    #[must_use]
+    pub fn with_local_process_group_id(mut self, id: u32) -> Self {
+        self.local_process_group_id = Some(id);
+        self
+    }
+
+    /// Verified local process-group ID owned by this backend, if any.
+    #[must_use]
+    pub const fn local_process_group_id(&self) -> Option<u32> {
+        self.local_process_group_id
+    }
+
+    /// Nonblocking process completion check.
+    /// # Errors
+    /// Returns an operating-system error while inspecting the process.
+    pub fn try_wait(&mut self) -> std::io::Result<Option<ChildStatus>> {
+        self.process.try_wait()
+    }
+
+    /// Stop the processes owned by this backend, returning promptly.
+    ///
+    /// The standard-child adapter stops only the direct child; backends with
+    /// an explicit process-tree ownership mechanism may stop descendants.
+    /// # Errors
+    /// Returns an operating-system error while terminating the process.
+    pub fn terminate(&mut self) -> std::io::Result<()> {
+        self.process.terminate()
+    }
+
+    /// Take the captured stdin pipe.
+    pub fn take_stdin(&mut self) -> Option<File> {
+        self.stdin.take()
+    }
+
+    /// Take the captured stdout pipe.
+    pub fn take_stdout(&mut self) -> Option<File> {
+        self.stdout.take()
+    }
+
+    /// Take the captured stderr pipe.
+    pub fn take_stderr(&mut self) -> Option<File> {
+        self.stderr.take()
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn stdout_mut(&mut self) -> Option<&mut File> {
+        self.stdout.as_mut()
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn stderr_mut(&mut self) -> Option<&mut File> {
+        self.stderr.as_mut()
+    }
+}
+
+struct StdOwnedProcess(Child);
+
+impl OwnedProcess for StdOwnedProcess {
+    fn id(&self) -> Option<u32> {
+        Some(self.0.id())
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<ChildStatus>> {
+        self.0.try_wait().map(|status| {
+            status.map(|status| ChildStatus {
+                code: status.code(),
+            })
+        })
+    }
+
+    fn terminate(&mut self) -> std::io::Result<()> {
+        self.0.kill()
+    }
+}
+
+#[cfg(unix)]
+#[allow(clippy::unnecessary_wraps)] // Other targets return Unsupported for this conversion.
+fn child_stdin_file(pipe: std::process::ChildStdin) -> std::io::Result<File> {
+    use std::os::fd::OwnedFd;
+    Ok(File::from(OwnedFd::from(pipe)))
+}
+
+#[cfg(unix)]
+#[allow(clippy::unnecessary_wraps)] // Other targets return Unsupported for this conversion.
+fn child_stdout_file(pipe: std::process::ChildStdout) -> std::io::Result<File> {
+    use std::os::fd::OwnedFd;
+    Ok(File::from(OwnedFd::from(pipe)))
+}
+
+#[cfg(unix)]
+#[allow(clippy::unnecessary_wraps)] // Other targets return Unsupported for this conversion.
+fn child_stderr_file(pipe: std::process::ChildStderr) -> std::io::Result<File> {
+    use std::os::fd::OwnedFd;
+    Ok(File::from(OwnedFd::from(pipe)))
+}
+
+#[cfg(windows)]
+#[allow(clippy::unnecessary_wraps)] // Other targets return Unsupported for this conversion.
+fn child_stdin_file(pipe: std::process::ChildStdin) -> std::io::Result<File> {
+    use std::os::windows::io::OwnedHandle;
+    Ok(File::from(OwnedHandle::from(pipe)))
+}
+
+#[cfg(windows)]
+#[allow(clippy::unnecessary_wraps)] // Other targets return Unsupported for this conversion.
+fn child_stdout_file(pipe: std::process::ChildStdout) -> std::io::Result<File> {
+    use std::os::windows::io::OwnedHandle;
+    Ok(File::from(OwnedHandle::from(pipe)))
+}
+
+#[cfg(windows)]
+#[allow(clippy::unnecessary_wraps)] // Other targets return Unsupported for this conversion.
+fn child_stderr_file(pipe: std::process::ChildStderr) -> std::io::Result<File> {
+    use std::os::windows::io::OwnedHandle;
+    Ok(File::from(OwnedHandle::from(pipe)))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn unsupported_pipe<T>(_pipe: T) -> std::io::Result<File> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "captured child pipes are unsupported on this platform",
+    ))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn child_stdin_file(pipe: std::process::ChildStdin) -> std::io::Result<File> {
+    unsupported_pipe(pipe)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn child_stdout_file(pipe: std::process::ChildStdout) -> std::io::Result<File> {
+    unsupported_pipe(pipe)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn child_stderr_file(pipe: std::process::ChildStderr) -> std::io::Result<File> {
+    unsupported_pipe(pipe)
 }
 
 #[cfg(test)]
